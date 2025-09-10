@@ -14,13 +14,6 @@
 				<configuration>
 					<release>17</release>
 					<encoding>UTF-8</encoding>
-					<annotationProcessorPaths>
-						<path>
-							<groupId>org.openjdk.jmh</groupId>
-							<artifactId>jmh-generator-annprocess</artifactId>
-							<version>${jmh.version}</version>
-						</path>
-					</annotationProcessorPaths>
 				</configuration>
 			</plugin>
 			<plugin>
@@ -63,6 +56,11 @@
 			<version>2.1.8</version>
 		</dependency>
 		<dependency>
+			<groupId>org.ejml</groupId>
+			<artifactId>ejml-dsparse</artifactId>
+			<version>0.43.1</version>
+		</dependency>
+		<dependency>
 			<groupId>org.junit.jupiter</groupId>
 			<artifactId>junit-jupiter-engine</artifactId>
 			<version>5.13.4</version>
@@ -73,11 +71,6 @@
 			<artifactId>junit-jupiter-params</artifactId>
 			<version>5.13.4</version>
 			<scope>test</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.ejml</groupId>
-			<artifactId>ejml-dsparse</artifactId>
-			<version>0.43.1</version>
 		</dependency>
 	</dependencies>
 </project>
