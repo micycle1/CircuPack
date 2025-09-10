@@ -10,6 +10,14 @@ A robust Java library that computes Euclidean circle packings from triangulation
 
 <div style="display:flex; gap:0.5rem; justify-content:center;"> <img src="resources/poisson_pack.png" alt="Poisson 1" style="width:33.333%;" /> <img src="resources/hex_pack.png" alt="Poisson 2" style="width:33.333%;" /> <img src="resources/nrooks_pack.png" alt="Poisson 3" style="width:33.333%;" /> </div>
 
+---
+
+<p align="center">
+    <img src="resources/poisson_pack.png" width="30%" height="auto" >
+    <img src="resources/hex_pack.png" width="30%" height="auto">
+    <img src="resources/nrooks_pack.png" width="30%" height="auto">
+</p>
+
 
 ## Core Idea
 
