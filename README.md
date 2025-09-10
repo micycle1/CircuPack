@@ -4,20 +4,11 @@
 
 A robust Java library that computes Euclidean circle packings from triangulations. Ported from Gerald Orick’s [GOPack](https://github.com/kensmath/GOPack) for accuracy and reliability.
 
-<table align="center"> <tr> <td><img src="resources/poisson_pack.png" alt="Poisson 1" style="width:33.333%;height:auto;display:block;"/></td> <td><img src="resources/hex_pack.png" alt="Hex 2" style="width:33.333%;height:auto;display:block;"/></td> <td><img src="resources/nrooks_pack.png" alt="NRooks 3" style="width:33.333%;height:auto;display:block;"/></td> </tr> </table>
-
-<p align="center"> <img src="resources/poisson_pack.png" alt="Poisson 1" width="33.333%" style="height:auto;"/> <img src="resources/hex_pack.png" alt="Hex 2" width="33.333%" style="height:auto;"/> <img src="resources/nrooks_pack.png" alt="NRooks 3" width="33.333%" style="height:auto;"/> </p>
-
-<div style="display:flex; gap:0.5rem; justify-content:center;"> <img src="resources/poisson_pack.png" alt="Poisson 1" style="width:33.333%;" /> <img src="resources/hex_pack.png" alt="Poisson 2" style="width:33.333%;" /> <img src="resources/nrooks_pack.png" alt="Poisson 3" style="width:33.333%;" /> </div>
-
----
-
 <p align="center">
-    <img src="resources/poisson_pack.png" width="30%" height="auto" >
-    <img src="resources/hex_pack.png" width="30%" height="auto">
-    <img src="resources/nrooks_pack.png" width="30%" height="auto">
+    <img src="resources/poisson_pack.png" width="31%" height="auto" >
+    <img src="resources/hex_pack.png" width="31%" height="auto">
+    <img src="resources/nrooks_pack.png" width="31%" height="auto">
 </p>
-
 
 ## Core Idea
 
