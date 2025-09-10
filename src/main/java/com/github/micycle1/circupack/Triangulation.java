@@ -28,7 +28,7 @@ public interface Triangulation {
 	/**
 	 * The neighbor list ("flower") for vertex v in CCW order. For interior vertices
 	 * the list is cyclic; for boundary vertices it's open.
-	 * 
+	 *
 	 * NOTE MATLAB code often stored flowers with the first neighbor repeated at the
 	 * end for interior vertices (flower(1) == flower(end)). Our interface forbids
 	 * that repetition
@@ -107,11 +107,6 @@ public interface Triangulation {
 	/** Set radii: default no-op. */
 	default void setRadii(double[] radii) {
 		/* no-op */ }
-
-	/** True if radii present. Default false. */
-	default boolean hasRadii() {
-		return false;
-	}
 
 	/**
 	 * vAims: target angle-sum array length n or null if omitted. Default: null

@@ -12,8 +12,9 @@ public final class RandomBoundaryPoints {
 	}
 
 	public static double[][] sample(double[] graphX, double[] graphY, int M, Random rnd) {
-		if (rnd == null)
+		if (rnd == null) {
 			rnd = new Random();
+		}
 		if (graphX == null || graphY == null || graphX.length != graphY.length || graphX.length < 3 || M < 3) {
 			return new double[][] { new double[0], new double[0] };
 		}
@@ -40,8 +41,9 @@ public final class RandomBoundaryPoints {
 		double L = marks[N - 1];
 
 		double[] arclocs = new double[M];
-		for (int i = 0; i < M; i++)
+		for (int i = 0; i < M; i++) {
 			arclocs[i] = rnd.nextDouble() * L;
+		}
 		java.util.Arrays.sort(arclocs);
 
 		double[] bx = new double[M];
@@ -49,8 +51,9 @@ public final class RandomBoundaryPoints {
 		int seg = 0;
 		for (int i = 0; i < M; i++) {
 			double t = arclocs[i];
-			while (seg + 1 < N && marks[seg + 1] < t)
+			while (seg + 1 < N && marks[seg + 1] < t) {
 				seg++;
+			}
 			double s0 = marks[seg];
 			double s1 = marks[seg + 1];
 			double ratio = (t - s0) / Math.max(1e-16, (s1 - s0));

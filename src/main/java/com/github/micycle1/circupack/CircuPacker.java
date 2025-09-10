@@ -1,32 +1,98 @@
 package com.github.micycle1.circupack;
 
-import org.ejml.ops.DConvertMatrixStruct;
-import org.ejml.sparse.FillReducing;
-import org.ejml.sparse.csc.CommonOps_DSCC;
-import org.ejml.sparse.csc.factory.LinearSolverFactory_DSCC;
-import org.ojalgo.matrix.decomposition.LU;
-import org.ojalgo.matrix.decomposition.QR;
-import org.ojalgo.matrix.store.MatrixStore;
-import org.ojalgo.matrix.store.R064Store;
-import org.ojalgo.matrix.store.SparseStore;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Queue;
+import java.util.stream.Collectors;
+
 import org.ejml.data.DMatrixRMaj;
 import org.ejml.data.DMatrixSparseCSC;
 import org.ejml.data.DMatrixSparseTriplet;
 import org.ejml.interfaces.linsol.LinearSolverSparse;
-
-import java.util.*;
-import java.util.stream.Collectors;
+import org.ejml.ops.DConvertMatrixStruct;
+import org.ejml.sparse.FillReducing;
+import org.ejml.sparse.csc.factory.LinearSolverFactory_DSCC;
 
 /**
- * Java port of the MATLAB @GOPacker engine. Focus: Euclidean MAX_PACK and
- * POLYGONAL modes. Supports spherical faux boundary, effective radii,
- * Tutte-like embedding, boundary layout (horocycles in unit disk, rectangle,
- * general polygon), conductance/incircle computation, visual error, angle-sum
- * error, pruning orphans, etc.
+ * <p>
+ * Core repacking engine for circle packings — a Java port of Gerald Orick's
+ * GOPacker MATLAB code. Manages combinatorics, geometric data, sparse matrix
+ * assembly, and iterative repacking (riffle) to compute Euclidean circle
+ * packings (default MAX_PACK) and polygonal/rectangular boundary layouts.
+ * </p>
  *
- * Works with the provided Triangulation interface (0-based indices).
+ * <p>
+ * What:
+ * </p>
+ * <ul>
+ * <li>Holds derived combinatorics (interior component, boundary loop, orphans)
+ * extracted from a provided {@code Triangulation} implementation.</li>
+ * <li>Maintains working geometry: {@code localRadii}, {@code localCentersX/Y}
+ * and final {@code radii}, {@code centersX/Y} arrays.</li>
+ * <li>Provides the main iteration: boundary placement, Tutte-style interior
+ * embedding (sparse linear system), and effective-radii updates.</li>
+ * <li>Supports auxiliary tasks: prune orphans, polygonal rectangle support,
+ * tangency computation, and spherical affine normalization.</li>
+ * </ul>
+ *
+ * <p>
+ * Why:
+ * </p>
+ * <p>
+ * Encapsulates the repacking algorithms so callers only need to supply
+ * combinatorics (via {@code Triangulation}) and optionally initial geometry.
+ * The engine is written for correctness, debuggability and unit-testing: matrix
+ * assembly and solves are explicit and instrumentable, and critical operations
+ * (inRadii, conductance, RHS assembly) are isolated for verification.
+ * </p>
+ *
+ * <p>
+ * Key usage pattern:
+ * </p>
+ * <ol>
+ * <li>Construct with a {@code Triangulation} instance (0-based indices).</li>
+ * <li>Call {@code initialize()} to derive internal state and defaults.</li>
+ * <li>Optionally call {@code setMode(...)} for polygonal modes or set
+ * corners/sides.</li>
+ * <li>Run {@code riffle(passCount)} to iterate layout and radius updates.</li>
+ * <li>Retrieve results or {@code writeBackToTriangulation()} to store
+ * centers/radii.</li>
+ * </ol>
+ *
+ * <p>
+ * Important assumptions & notes:
+ * </p>
+ * <ul>
+ * <li>Triangulation contract: {@code getFlower(v)} returns CCW neighbor lists;
+ * interior flowers are cyclic (no repeated first element), boundary flowers are
+ * open (first != last). {@code getBoundaryLoop()} must be CCW and list each
+ * boundary vertex exactly once (no repeated close).</li>
+ * <li>Vertex indices are 0-based.</li>
+ * <li>Radii should be positive; small or zero radii can cause numerical
+ * issues.</li>
+ * <li>The class is not thread-safe; callers should synchronize externally if
+ * needed.</li>
+ * </ul>
+ *
+ * <p>
+ * Numerical/stability hints:
+ * </p>
+ * <ul>
+ * <li>For classic MAX_PACK behavior, freeze boundary radii (engine supports
+ * this) to maximize stability on small complexes.</li>
+ * <li>GO-style boundary updates can be enabled but are damped/clamped in the
+ * implementation to avoid runaway oscillation.</li>
+ * <li>Monitoring values such as {@code maxVis} (dimensionless relative visual
+ * error) and debug routines (row dumps, boundary stats) are provided for
+ * diagnosis.</li>
+ * </ul>
  */
-public class GOPackerEngine {
+public class CircuPacker {
 
 	// External triangulation (combinatorics and optional geometry)
 	private final Triangulation tri;
@@ -104,15 +170,42 @@ public class GOPackerEngine {
 	private final List<Double> visErrMonitor = new ArrayList<>();
 
 	// Constructor
-	public GOPackerEngine(Triangulation tri) {
+	public CircuPacker(Triangulation tri) {
 		this.tri = Objects.requireNonNull(tri, "tri must not be null");
 	}
 
 	// Initialize combinatorics, defaults, radii/centers, aims, mode
+	/**
+	 * <p>
+	 * Initialize internal engine state from the provided {@code Triangulation}.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Reads vertex count, boundary loop, flowers, optional
+	 * centers/radii/aims.</li>
+	 * <li>Classifies interior/boundary/orphan vertices and builds default
+	 * layout/rim sets.</li>
+	 * <li>Initializes working arrays: {@code localRadii}, {@code localCentersX/Y},
+	 * {@code vAims}, and polygon metadata if present.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Prepare all derived combinatorial and geometric arrays so subsequent packing
+	 * operations (layout, update, riffle) can assume a consistent internal
+	 * representation.
+	 * </p>
+	 */
 	public void initialize() {
 		n = tri.getVertexCount();
-		if (n <= 0)
+		if (n <= 0) {
 			throw new IllegalStateException("Triangulation has no vertices");
+		}
 
 		// read mode hint
 		mode = tri.getMode() != null ? tri.getMode() : Triangulation.Mode.MAX_PACK;
@@ -146,7 +239,7 @@ public class GOPackerEngine {
 		deriveInteriorBoundaryOrphans();
 
 		// Copy provided geometry if available; else default
-		if (tri.hasRadii()) {
+		if (tri.getRadii() != null) {
 			radii = tri.getRadii().clone();
 		} else {
 			radii = new double[n];
@@ -169,15 +262,17 @@ public class GOPackerEngine {
 		// aims
 		if (tri.hasVAims()) {
 			double[] a = tri.getVAims();
-			if (a != null && a.length == n)
+			if (a != null && a.length == n) {
 				vAims = a.clone();
+			}
 		}
 		if (vAims == null) {
 			vAims = new double[n];
 			Arrays.fill(vAims, 2.0 * Math.PI);
 			for (int v = 0; v < n; v++) {
-				if (isBoundary[v])
+				if (isBoundary[v]) {
 					vAims[v] = -1.0;
+				}
 			}
 		}
 
@@ -210,8 +305,9 @@ public class GOPackerEngine {
 	// Public API methods
 
 	public void setMode(Triangulation.Mode desiredMode, int[] cornersIn, List<int[]> sidesIn, double[] cornerAngles) {
-		if (desiredMode == null)
+		if (desiredMode == null) {
 			desiredMode = Triangulation.Mode.MAX_PACK;
+		}
 
 		if (hes > 0 && desiredMode != Triangulation.Mode.MAX_PACK) {
 			// Sphere must be in MAX_PACK
@@ -223,9 +319,11 @@ public class GOPackerEngine {
 		if (this.mode == Triangulation.Mode.MAX_PACK) {
 			// aims: interior 2*pi; boundary -1
 			Arrays.fill(vAims, 2.0 * Math.PI);
-			for (int v = 0; v < n; v++)
-				if (isBoundary[v])
+			for (int v = 0; v < n; v++) {
+				if (isBoundary[v]) {
 					vAims[v] = -1.0;
+				}
+			}
 			return;
 		}
 
@@ -250,24 +348,28 @@ public class GOPackerEngine {
 		}
 
 		// set default aims: boundary pi except corners get equal angles by default
-		for (int w : rimVerts)
+		for (int w : rimVerts) {
 			vAims[w] = Math.PI;
+		}
 		if (cornerAngles != null) {
 			if (cornerAngles.length != this.corners.length) {
 				throw new IllegalArgumentException("Corner angles length mismatch");
 			}
-			for (int i = 0; i < this.corners.length; i++)
+			for (int i = 0; i < this.corners.length; i++) {
 				vAims[this.corners[i]] = cornerAngles[i];
+			}
 		} else {
 			int m = this.corners.length;
-			for (int i = 0; i < m; i++)
+			for (int i = 0; i < m; i++) {
 				vAims[this.corners[i]] = Math.PI * (1.0 - 2.0 / m);
+			}
 		}
 	}
 
 	public void debugDumpSystemRow0() {
-		if (layCount == 0)
+		if (layCount == 0) {
 			return;
+		}
 		int v = layoutVerts[0];
 		double vrad = localRadii[v];
 		var fl = tri.getFlower(v);
@@ -307,20 +409,20 @@ public class GOPackerEngine {
 	}
 
 	public int riffle(int passNum) {
-		if (passNum <= 0) {
-			layoutBoundary();
-			layoutCentersSolve();
-			updateVisErrorMonitor();
-			return 0;
-		}
+//		if (passNum <= 0) {
+//			layoutBoundary();
+//			layoutCentersSolve();
+//			updateVisErrorMonitor();
+//			return 0;
+//		}
 
-		double cutval = 0.01;
+		double cutval = 0.1; // 1% of radius
 		int pass = 0;
 		double maxVis = 2 * cutval;
 
 		while (pass < passNum && maxVis > cutval) {
 			layoutBoundary(); // set boundary centers (and possibly scale radii)
-			layoutCentersSolve(); // solve A * Z = rhs for interior centers
+			layoutCentersSolveFast(); // solve A * Z = rhs for interior centers
 			setEffectiveRadii(); // update effective radii
 			maxVis = updateVisErrorMonitor();
 			pass++;
@@ -332,6 +434,61 @@ public class GOPackerEngine {
 		return pass;
 	}
 
+	/****
+	 * <p>
+	 * Computes, for each interior vertex, the maximum "relative visual error" (RVE)
+	 * across all incident edges and returns those maxima in an array.
+	 * </p>
+	 *
+	 * <p>
+	 * For a given interior vertex <code>v = layoutVerts[i]</code>, each neighbor
+	 * <code>w</code> in v's flower is inspected and the edge RVE is computed as:
+	 * </p>
+	 *
+	 * <pre>
+	 * RVE(v,w) = | |z_v - z_w| - (r_v + r_w) | / r_v
+	 * </pre>
+	 *
+	 * <ul>
+	 * <li><code>z_v, z_w</code> are Euclidean centers
+	 * (<code>localCentersX</code>/<code>localCentersY</code>).</li>
+	 * <li><code>r_v, r_w</code> are Euclidean radii (<code>localRadii</code>).</li>
+	 * <li><code>|z_v - z_w|</code> is the center-to-center distance (computed with
+	 * <code>Math.hypot</code>).</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * The per-vertex value is the maximum <code>RVE(v,w)</code> over all neighbors
+	 * <code>w</code> of <code>v</code>. The returned array contains those
+	 * per-vertex maxima in the same order as <code>layoutVerts</code>.
+	 * </p>
+	 *
+	 * <h4>Units</h4>
+	 * <p>
+	 * Dimensionless (ratio). Interpretation examples:
+	 * </p>
+	 * <ul>
+	 * <li><code>0.00</code> = perfect tangency on all incident edges (ideal).</li>
+	 * <li><code>0.01</code> ≈ 1% of v's radius (very good).</li>
+	 * <li><code>0.10</code> ≈ 10% of v's radius (noticeable).</li>
+	 * <li><code>1.00</code> ≈ mismatch comparable to v's radius (poor).</li>
+	 * </ul>
+	 *
+	 * <h4>Notes</h4>
+	 * <ul>
+	 * <li>Only vertices listed in <code>layoutVerts</code> (interior/layout
+	 * vertices) are processed.</li>
+	 * <li>Boundary-to-boundary edges are not directly included unless the boundary
+	 * vertex is a neighbor of an interior vertex.</li>
+	 * <li>To avoid division by zero when <code>r_v</code> is extremely small, the
+	 * denominator uses <code>Math.max(1e-16, r_v)</code>. Very small radii can
+	 * cause the ratio to spike.</li>
+	 * </ul>
+	 *
+	 * @return an array of length <code>layCount</code> where element <code>i</code>
+	 *         is the maximum relative visual error for vertex
+	 *         <code>layoutVerts[i]</code> (dimensionless).
+	 */
 	public double[] visualErrors() {
 		double[] errs = new double[layCount];
 		for (int i = 0; i < layCount; i++) {
@@ -346,8 +503,9 @@ public class GOPackerEngine {
 				double cdiff = Math.hypot(dx, dy);
 				double rdiff = rv + localRadii[w];
 				double me = Math.abs(cdiff - rdiff) / Math.max(1e-16, rv);
-				if (me > maxErr)
+				if (me > maxErr) {
 					maxErr = me;
+				}
 			}
 			errs[i] = maxErr;
 		}
@@ -375,27 +533,58 @@ public class GOPackerEngine {
 		return diffs;
 	}
 
+	/**
+	 * <p>
+	 * Remove orphan vertices (those not in the interior component and not on the
+	 * rim).
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Constructs a trimmed mapping that preserves the alpha-component interiors
+	 * and the boundary, discarding orphan vertices and updating radii/centers
+	 * arrays accordingly.</li>
+	 * <li>Recomputes combinatorics and index mappings after removal.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Orphans complicate layout and may produce artifacts; pruned complexes are
+	 * smaller and lead to simpler linear systems. This is an optional
+	 * transformation that mutates internal arrays to operate on the reduced
+	 * complex.
+	 * </p>
+	 */
 	public void pruneOrphans() {
 		// If no orphans, nothing to do
-		if (orphanCount == 0)
+		if (orphanCount == 0) {
 			return;
+		}
 
 		// Remove orphan vertices from triangulation view within the engine
 		// We don't mutate Triangulation; we adjust our working sets and geometry
 		// arrays.
 		int newN = intCount + bdryCount; // keep alpha-component interiors and boundary
 		boolean[] keep = new boolean[n];
-		for (int v : intVerts)
+		for (int v : intVerts) {
 			keep[v] = true;
-		for (int i = 0; i < bdryCount; i++)
+		}
+		for (int i = 0; i < bdryCount; i++) {
 			keep[bdryListClosed[i]] = true;
+		}
 
 		int[] old2new = new int[n];
 		Arrays.fill(old2new, -1);
 		int kk = 0;
-		for (int v = 0; v < n; v++)
-			if (keep[v])
+		for (int v = 0; v < n; v++) {
+			if (keep[v]) {
 				old2new[v] = kk++;
+			}
+		}
 
 		// Rebuild arrays
 		double[] nr = new double[newN];
@@ -418,11 +607,13 @@ public class GOPackerEngine {
 
 		// Rebuild interior/boundary indices
 		int[] nInt = new int[intCount];
-		for (int i = 0; i < intCount; i++)
+		for (int i = 0; i < intCount; i++) {
 			nInt[i] = old2new[intVerts[i]];
+		}
 		int[] nBdryClosed = new int[bdryCount + 1];
-		for (int i = 0; i < bdryCount + 1; i++)
+		for (int i = 0; i < bdryCount + 1; i++) {
 			nBdryClosed[i] = old2new[bdryListClosed[i]];
+		}
 
 		intVerts = nInt;
 		intCount = nInt.length;
@@ -447,8 +638,9 @@ public class GOPackerEngine {
 		tri.setCenters(centersX.clone(), centersY.clone());
 		tri.setVAims(vAims.clone());
 		tri.setAlpha(alpha);
-		if (gamma >= 0)
+		if (gamma >= 0) {
 			tri.setGamma(gamma);
+		}
 	}
 
 	// Getters for testing
@@ -483,12 +675,15 @@ public class GOPackerEngine {
 	// --------------- Internals ---------------
 
 	private int[] chooseRandomCorners(int sideN) {
-		if (bdryCount < 3)
+		if (bdryCount < 3) {
 			throw new IllegalStateException("Boundary must have at least 3 vertices");
-		if (sideN < 3)
+		}
+		if (sideN < 3) {
 			sideN = 3;
-		if (sideN > bdryCount)
+		}
+		if (sideN > bdryCount) {
 			sideN = bdryCount;
+		}
 
 		int[] crn = new int[sideN];
 		int step = Math.max(1, bdryCount / sideN);
@@ -539,8 +734,9 @@ public class GOPackerEngine {
 			// All others are interiors
 			List<Integer> ints = new ArrayList<>();
 			for (int v = 0; v < n; v++) {
-				if (v != a && v != b && v != c)
+				if (v != a && v != b && v != c) {
 					ints.add(v);
+				}
 			}
 			intVerts = ints.stream().mapToInt(Integer::intValue).toArray();
 			intCount = intVerts.length;
@@ -576,8 +772,9 @@ public class GOPackerEngine {
 		// Collect intVerts (alpha component)
 		List<Integer> ints = new ArrayList<>();
 		for (int v = 0; v < n; v++) {
-			if (!isBoundary[v] && touchedInterior[v])
+			if (!isBoundary[v] && touchedInterior[v]) {
 				ints.add(v);
+			}
 		}
 		intVerts = ints.stream().mapToInt(Integer::intValue).toArray();
 		intCount = intVerts.length;
@@ -585,22 +782,26 @@ public class GOPackerEngine {
 		// Build bdry loop closed (from Triangulation)
 		bdryCount = tri.getBoundaryLoop().size();
 		bdryListClosed = new int[bdryCount + 1];
-		for (int i = 0; i < bdryCount; i++)
+		for (int i = 0; i < bdryCount; i++) {
 			bdryListClosed[i] = tri.getBoundaryLoop().get(i);
+		}
 		bdryListClosed[bdryCount] = bdryListClosed[0];
 
 		// Orphans: not in intVerts and not in boundary loop
 		boolean[] isInInt = new boolean[n];
-		for (int v : intVerts)
+		for (int v : intVerts) {
 			isInInt[v] = true;
+		}
 		boolean[] isInB = new boolean[n];
-		for (int i = 0; i < bdryCount; i++)
+		for (int i = 0; i < bdryCount; i++) {
 			isInB[bdryListClosed[i]] = true;
+		}
 
 		List<Integer> orph = new ArrayList<>();
 		for (int v = 0; v < n; v++) {
-			if (!isInInt[v] && !isInB[v])
+			if (!isInInt[v] && !isInB[v]) {
 				orph.add(v);
+			}
 		}
 		orphanVerts = orph.stream().mapToInt(Integer::intValue).toArray();
 		orphanCount = orphanVerts.length;
@@ -612,8 +813,9 @@ public class GOPackerEngine {
 	}
 
 	private int farVertex(List<Integer> seeds) {
-		if (seeds == null || seeds.isEmpty())
+		if (seeds == null || seeds.isEmpty()) {
 			return (n > 0 ? 0 : -1);
+		}
 		int[] marks = new int[n]; // 0 = unvisited
 		Queue<Integer> q = new ArrayDeque<>();
 		for (int s : seeds) {
@@ -639,6 +841,32 @@ public class GOPackerEngine {
 		return far;
 	}
 
+	/**
+	 * <p>
+	 * Build index mappings used for matrix assembly and neighbor lookups.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Creates {@code indx2v} (sequential indices: layout verts then rim
+	 * verts).</li>
+	 * <li>Creates {@code v2indx} mapping original vertex -> index in the combined
+	 * list.</li>
+	 * <li>Sets {@code layCount} and {@code rimCount} used by solver and update
+	 * routines.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Sparse matrix assembly and RHS construction require a compact contiguous
+	 * indexing; this method centralizes that translation so the rest of the code
+	 * works with small dense/sparse structures indexed 0..m-1.
+	 * </p>
+	 */
 	private void buildIndexing() {
 		// indx2v: layout first, then rim vertices
 		indx2v = new int[layCount + rimCount];
@@ -654,6 +882,32 @@ public class GOPackerEngine {
 		}
 	}
 
+	/**
+	 * <p>
+	 * Place boundary centers according to the current packing mode.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Dispatches to {@code setHoroCenters}, {@code setPolyCenters}, or
+	 * {@code setRectCenters} depending on the engine {@code mode} and polygon
+	 * metadata.</li>
+	 * <li>May also scale {@code localRadii} to match a normalized boundary (e.g.,
+	 * unit circle).</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Boundary placement is mode-specific: max-pack uses horocycles in the unit
+	 * disc, polygonal mode places centers on a normalized n-gon. Centralizing the
+	 * choice avoids duplicated logic and ensures consistent scaling before interior
+	 * layout.
+	 * </p>
+	 */
 	private void layoutBoundary() {
 		if (mode == Triangulation.Mode.POLYGONAL || mode == Triangulation.Mode.FIXED_CORNERS) {
 			setPolygonCenters();
@@ -662,6 +916,34 @@ public class GOPackerEngine {
 		}
 	}
 
+	/**
+	 * <p>
+	 * Lay out boundary circles as horocycles inside the unit circle for MAX_PACK.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>If only three boundary vertices: place them symmetrically and set aims to
+	 * zero.</li>
+	 * <li>Otherwise: compute a scalar {@code R} by Newton iteration so that the
+	 * angles formed by tangent circles sum to 2π, then scale radii by 1/R.</li>
+	 * <li>Position boundary centers consecutively along the unit circle using the
+	 * computed turning angles; the first center is placed on the positive imaginary
+	 * axis.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * This is the standard initialization for disc-style max packing: boundary
+	 * circles are placed so that when interpreted as horocycles their tangency
+	 * geometry matches the intended discrete turning angles, providing a stable
+	 * starting layout for interior Tutte-style embedding.
+	 * </p>
+	 */
 	private void setHoroCenters() {
 		// Special case: only 3 boundary vertices => equilateral symmetric
 		if (bdryCount <= 3) {
@@ -698,8 +980,9 @@ public class GOPackerEngine {
 		}
 		r[bdryCount] = r[0];
 		double R = sum / Math.PI;
-		if (R < 2.0 * minrad)
+		if (R < 2.0 * minrad) {
 			R = 3.0 * minrad;
+		}
 
 		int trys = 0;
 		while (trys < 100) {
@@ -729,10 +1012,12 @@ public class GOPackerEngine {
 		}
 
 		// Scale all radii by 1/R
-		for (int v = 0; v < n; v++)
+		for (int v = 0; v < n; v++) {
 			localRadii[v] /= R;
-		for (int j = 0; j <= bdryCount; j++)
+		}
+		for (int j = 0; j <= bdryCount; j++) {
 			r[j] /= R;
+		}
 
 		// Place boundary centers around unit circle, first on +i axis
 		int v1 = bdryListClosed[0];
@@ -756,12 +1041,40 @@ public class GOPackerEngine {
 		}
 	}
 
+	/**
+	 * <p>
+	 * Place boundary centers and scale radii for polygonal packing (general n-gon).
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Computes current side lengths from {@code localRadii}, derives target
+	 * side lengths (triangles by law of sines, even-odd strategies otherwise), and
+	 * scales radii.</li>
+	 * <li>Computes edge directions from corner aims and lays out each side
+	 * incrementally, then recenters and rescales so a normalization condition holds
+	 * (first corner at 1+i or i).</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Polygonal packing requires boundary centers to sit on a specific polygonal
+	 * shape whose side lengths are consistent with circle diameters; this method
+	 * enforces those proportions and normalization so interior embedding solves
+	 * behave predictably.
+	 * </p>
+	 */
 	private void setPolygonCenters() {
 		// if rectangle (4 corners) with all right angles, do rectangular layout
 		if (corners != null && corners.length == 4) {
 			double bendErr = 0.0;
-			for (int c : corners)
+			for (int c : corners) {
 				bendErr += Math.abs(vAims[c] - Math.PI / 2.0);
+			}
 			if (bendErr <= 1e-5) {
 				setRectCenters();
 				return;
@@ -778,8 +1091,9 @@ public class GOPackerEngine {
 		for (int i = 0; i < numSides; i++) {
 			int[] side = sides.get(i);
 			double L = localRadii[side[0]] + localRadii[side[side.length - 1]];
-			for (int j = 1; j < side.length - 1; j++)
+			for (int j = 1; j < side.length - 1; j++) {
 				L += 2.0 * localRadii[side[j]];
+			}
 			sideLengths[i] = L;
 			fullLength += L;
 		}
@@ -790,8 +1104,9 @@ public class GOPackerEngine {
 			// triangle with corner aims provided in vAims at corners
 			double opp1 = vAims[corners[2]];
 			double opp2 = vAims[corners[0]];
-			if (opp1 <= 0 || opp2 <= 0 || (opp1 + opp2) >= Math.PI)
+			if (opp1 <= 0 || opp2 <= 0 || (opp1 + opp2) >= Math.PI) {
 				return;
+			}
 			double opp3 = Math.PI - (opp1 + opp2);
 			targetLength[0] = 1.0;
 			targetLength[1] = Math.sin(opp2) / Math.sin(opp1);
@@ -799,15 +1114,17 @@ public class GOPackerEngine {
 			double sum = targetLength[0] + targetLength[1] + targetLength[2];
 			double factor = sum / fullLength;
 			scaleAllLocalBy(factor);
-			for (int i = 0; i < numSides; i++)
+			for (int i = 0; i < numSides; i++) {
 				sideLengths[i] *= factor;
+			}
 		} else if (2 * halfn == numSides) {
 			// even: pair opposite sides, target total per pair equals average; set scale so
 			// sum target ~ 6
 			double factor = 6.0 / fullLength;
 			scaleAllLocalBy(factor);
-			for (int i = 0; i < numSides; i++)
+			for (int i = 0; i < numSides; i++) {
 				sideLengths[i] *= factor;
+			}
 			for (int j = 0; j < halfn; j++) {
 				targetLength[j] = (sideLengths[j] + sideLengths[halfn + j]) / 2.0;
 				targetLength[halfn + j] = targetLength[j];
@@ -895,14 +1212,42 @@ public class GOPackerEngine {
 		}
 	}
 
+	/**
+	 * <p>
+	 * Specialized layout for rectangular packings (four sides, right-angled
+	 * corners).
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>Computes averaged top/bottom and left/right side lengths and an aspect
+	 * ratio.</li>
+	 * <li>Scales {@code localRadii} to fit a rectangle centered at origin with y =
+	 * ±1 and x = ±aspect.</li>
+	 * <li>Distributes boundary centers proportionally along each rectangle
+	 * edge.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Rectangles are a common practical target; handling them explicitly yields
+	 * better aspect preservation and more stable side-length matching than the
+	 * general polygon routine.
+	 * </p>
+	 */
 	private void setRectCenters() {
 		// sides.size() == 4; corners count == 4
 		double[] sideLen = new double[4];
 		for (int i = 0; i < 4; i++) {
 			int[] side = sides.get(i);
 			double L = localRadii[side[0]] + localRadii[side[side.length - 1]];
-			for (int j = 1; j < side.length - 1; j++)
+			for (int j = 1; j < side.length - 1; j++) {
 				L += 2.0 * localRadii[side[j]];
+			}
 			sideLen[i] = L;
 		}
 		double width = (sideLen[0] + sideLen[2]) / 2.0;
@@ -912,8 +1257,9 @@ public class GOPackerEngine {
 		// scale radii so that total fits rectangle of width 2*aspect and height 2
 		double factor = 2.0 * (aspect + 1.0) / Math.max(1e-16, (width + height));
 		scaleAllLocalBy(factor);
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < 4; i++) {
 			sideLen[i] *= factor;
+		}
 
 		// rectangle corners: (1,aspect), (-1,aspect), (-1,-aspect), (1,-aspect)
 		double[] crx = { 1.0, -1.0, -1.0, 1.0 };
@@ -946,8 +1292,9 @@ public class GOPackerEngine {
 	}
 
 	private void scaleAllLocalBy(double factor) {
-		for (int v = 0; v < n; v++)
+		for (int v = 0; v < n; v++) {
 			localRadii[v] *= factor;
+		}
 	}
 
 	private List<int[]> derivePolygonSidesFromCorners(int[] crn) {
@@ -970,16 +1317,116 @@ public class GOPackerEngine {
 			while (true) {
 				k = (k + 1) % bdryCount;
 				side.add(loop.get(k));
-				if (loop.get(k) == b)
+				if (loop.get(k) == b) {
 					break;
-				if (side.size() > bdryCount + 5)
+				}
+				if (side.size() > bdryCount + 5) {
 					throw new IllegalStateException("Side extraction overflow");
+				}
 			}
 			result.add(side.stream().mapToInt(Integer::intValue).toArray());
 		}
 		return result;
 	}
 
+	private DMatrixRMaj solveSparseSystem(DMatrixSparseCSC A, DMatrixRMaj b) {
+		LinearSolverSparse<DMatrixSparseCSC, DMatrixRMaj> solver = LinearSolverFactory_DSCC.lu(FillReducing.NONE);
+		if (!solver.setA(A)) {
+			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
+		}
+		DMatrixRMaj x = new DMatrixRMaj(A.numCols, 1);
+		solver.solve(b, x);
+		return x;
+	}
+
+	/**
+	 * <p>
+	 * Compute interior centers by solving a Tutte-style sparse linear system.
+	 * </p>
+	 *
+	 * <p>
+	 * What (high-level):
+	 * </p>
+	 * <ol>
+	 * <li>Update local geometric precomputations via {@code updateVdata()}
+	 * (incircle radii and per-node conductances) for the current
+	 * {@code localRadii}.</li>
+	 * <li>Assemble a sparse m×m matrix {@code A} and two RHS vectors {@code bx} and
+	 * {@code by} (for X and Y coordinates) where m = number of
+	 * {@code layoutVerts}.</li>
+	 * <li>Solve two real sparse systems {@code A * zx = bx} and {@code A * zy = by}
+	 * to obtain the complex centers Z = zx + i zy at the layout vertices.</li>
+	 * <li>Write the solved coordinates back into {@code localCentersX/Y} for the
+	 * layout vertices.</li>
+	 * </ol>
+	 *
+	 * <p>
+	 * What (detailed assembly & math):
+	 * </p>
+	 * <p>
+	 * For each layout vertex v (sequential index i):
+	 * </p>
+	 * <ul>
+	 * <li>We set the diagonal entry A[i,i] = -1.0.</li>
+	 * <li>For each petal neighbor w in the flower of v, compute two adjacent
+	 * incircle radii t1,t2 from {@code inRadii[v]} and form the edge weight</li>
+	 * </ul>
+	 *
+	 * <pre>
+	 * weight = ((t1 + t2) / (r_v + r_w)) / conduct(v)
+	 * </pre>
+	 * <p>
+	 * where r_v and r_w are the current {@code localRadii} and {@code conduct(v)}
+	 * is the precomputed total conductance for v. If w is another layout vertex we
+	 * insert A[i, idx(w)] += weight; if w is a rim vertex we instead accumulate
+	 * contribution to the RHS:
+	 * </p>
+	 *
+	 * <pre>
+	 *   bx[i] += -weight * X_w
+	 *   by[i] += -weight * Y_w
+	 * </pre>
+	 *
+	 * <p>
+	 * Why the normalization by conduct(v)?
+	 * </p>
+	 * <p>
+	 * Dividing by the node conductance ensures the row sums of off-diagonal weights
+	 * reflect the random-walk style transition probabilities used in the original
+	 * GO approach and yields a well-scaled, diagonally-dominant system with the -1
+	 * diagonal.
+	 * </p>
+	 *
+	 * <p>
+	 * Implementation/practical notes:
+	 * </p>
+	 * <ul>
+	 * <li>We build {@code A} using a triplet builder ({@code DMatrixSparseTriplet})
+	 * and then convert to CSC ({@code DMatrixSparseCSC}) for the sparse solver —
+	 * this avoids repeated in-place additions that are expensive on CSC.</li>
+	 * <li>We split the complex unknown into two real solves (X and Y). This is
+	 * numerically equivalent to solving a complex system but leverages mature
+	 * sparse real solvers in EJML.</li>
+	 * <li>We apply small numerical safeguards: clamp denominators, avoid zero
+	 * conductances, and skip degenerate incircle values. If a row appears singular
+	 * the sparse solver will throw and calling code should inspect combinatorics
+	 * and radii for degeneracy.</li>
+	 * <li>Cost: assembly visits each interior petal once (O(sum deg(v))) and
+	 * solving cost depends on sparse factorization (typically near-linear for
+	 * planar graphs). Memory is O(n + nnz(A)).</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Tutte-style linear embedding with these geometrically derived weights
+	 * reproduces the GO embedding method: boundary centers act as fixed Dirichlet
+	 * values while interior centers are harmonic averages with weights determined
+	 * by the circle-in-circle geometry, producing visually faithful packings
+	 * consistent with target angle/area aims.
+	 * </p>
+	 */
 	private void layoutCentersSolve() {
 		updateVdata();
 
@@ -1034,32 +1481,19 @@ public class GOPackerEngine {
 		}
 	}
 
-	private DMatrixRMaj solveSparseSystem(DMatrixSparseCSC A, DMatrixRMaj b) {
-		LinearSolverSparse<DMatrixSparseCSC, DMatrixRMaj> solver = LinearSolverFactory_DSCC.lu(FillReducing.NONE);
-		if (!solver.setA(A)) {
-			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
-		}
-		DMatrixRMaj x = new DMatrixRMaj(A.numCols, 1);
-		solver.solve(b, x);
-		return x;
-	}
-
 	private void layoutCentersSolveFast() {
-
-		// ------------------------------------------------------------------
-		// 1) collect data ---------------------------------------------------
 		updateVdata();
 
-		/* ---------- estimate nnz and create once-only data structures ----- */
 		int estNnz = 0;
-		for (int k = 0; k < layCount; k++)
+		for (int k = 0; k < layCount; k++) {
 			estNnz += tri.getFlower(layoutVerts[k]).size() + 1;
+		}
 
 		DMatrixSparseTriplet Atr = new DMatrixSparseTriplet(layCount, layCount, estNnz);
 		double[] bx = new double[layCount];
 		double[] by = new double[layCount];
 
-		/* ---------- assemble A , bx , by ---------------------------------- */
+		// assemble A , bx , by
 		for (int i = 0; i < layCount; i++) {
 
 			int v = layoutVerts[i];
@@ -1069,12 +1503,13 @@ public class GOPackerEngine {
 			double[] iR = inRadii[i];
 			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
 
-			/* diagonal entry (always –1) */
+			// iagonal entry (always –1)
 			Atr.addItem(i, i, -1.0);
 
-			/* nothing to do if the flower is empty -------------------------------- */
-			if (m == 0)
+			// nothing to do if the flower is empty
+			if (m == 0) {
 				continue;
+			}
 
 			/* iterate flower, using prevR to avoid (j-1+m)%m */
 			double prevR = iR[m - 1];
@@ -1094,27 +1529,26 @@ public class GOPackerEngine {
 			}
 		}
 
-		// ------------------------------------------------------------------
-		// 2) convert to CSC only once and solve both RHS at once -------------
+		// 2) convert to CSC only once and solve both RHS at once
 		DMatrixSparseCSC A = DConvertMatrixStruct.convert(Atr, (DMatrixSparseCSC) null);
 
-		/* build RHS in correct row-major order -------------------------------- */
+		// build RHS in correct row-major order
 		DMatrixRMaj RHS = new DMatrixRMaj(layCount, 2);
 		for (int r = 0, p = 0; r < layCount; r++, p += 2) {
 			RHS.data[p] = bx[r]; // column 0 (x)
 			RHS.data[p + 1] = by[r]; // column 1 (y)
 		}
 
-		/* one LU factorisation – two solves ----------------------------------- */
-		LinearSolverSparse<DMatrixSparseCSC, DMatrixRMaj> solver = LinearSolverFactory_DSCC.lu(FillReducing.NONE);
-		if (!solver.setA(A))
+		// one LU factorisation – two solves
+		var solver = LinearSolverFactory_DSCC.lu(FillReducing.IDENTITY);
+		if (!solver.setA(A)) {
 			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
+		}
 
 		DMatrixRMaj sol = new DMatrixRMaj(layCount, 2);
 		solver.solve(RHS, sol);
 
-		// ------------------------------------------------------------------
-		// 3) copy results back ----------------------------------------------
+		// 3) copy results back
 		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
 			localCentersX[v] = sol.get(i, 0);
@@ -1122,97 +1556,32 @@ public class GOPackerEngine {
 		}
 	}
 
-	private void layoutCentersSolveoJ() {
-		updateVdata();
-
-		final int n = layCount;
-
-		// Estimate nnz: diagonal + one per neighbour; add some headroom
-		int estNnz = n;
-		for (int i = 0; i < n; i++) {
-			estNnz += tri.getFlower(layoutVerts[i]).size();
-		}
-		estNnz += n;
-
-		// Assemble in SparseStore (COO-ish), then convert to CSR
-		final SparseStore<Double> Acoo = SparseStore.R064.make(n, n);
-		final double[] bx = new double[n];
-		final double[] by = new double[n];
-
-		for (int i = 0; i < n; i++) {
-			final int v = layoutVerts[i];
-			final double vrad = localRadii[v];
-			final var fl = tri.getFlower(v);
-			final int m = fl.size();
-			final double[] iR = inRadii[i];
-
-			final double invCond = 1.0 / Math.max(1e-16, conduct[i]);
-
-			// Diagonal
-			Acoo.add(i, i, -1.0);
-
-			for (int j = 0; j < m; j++) {
-				final int w = fl.get(j);
-
-				final double t1 = iR[(j == 0 ? m - 1 : j - 1)];
-				final double t2 = iR[j];
-				final double denom = Math.max(1e-16, vrad + localRadii[w]);
-				final double coeff = (t1 + t2) * (1.0 / denom) * invCond;
-
-				final int idxW = v2indx[w];
-				if (0 <= idxW && idxW < n) {
-					// Interior neighbour -> A contribution (add() accumulates)
-					Acoo.add(i, idxW, coeff);
-				} else {
-					// Boundary neighbour -> RHS contribution
-					bx[i] -= coeff * localCentersX[w];
-					by[i] -= coeff * localCentersY[w];
-				}
-			}
-		}
-
-		final MatrixStore<Double> A = Acoo.toCSR(); // or toCSC(); both work with sparse LU
-
-		// Two RHS columns
-		final R064Store B = R064Store.FACTORY.make(n, 2);
-		for (int i = 0; i < n; i++) {
-			B.set(i, 0, bx[i]);
-			B.set(i, 1, by[i]);
-		}
-
-		// Sparse LU once, solve both RHS at once
-		final LU<Double> lu = LU.R064.make();
-		if (!lu.decompose(A) || !lu.isSolvable()) {
-			throw new IllegalStateException("Failed to solve (singular/ill-conditioned system)");
-		}
-		final MatrixStore<Double> X = lu.getSolution(B);
-
-		// Write back
-		for (int i = 0; i < n; i++) {
-			final int v = layoutVerts[i];
-			localCentersX[v] = X.doubleValue(i, 0);
-			localCentersY[v] = X.doubleValue(i, 1);
-		}
-	}
-
-	// Robust solver: LU first (fast), QR fallback (robust)
-	private R064Store solveSparseSystemOjAlgoR064(final MatrixStore<Double> A, final R064Store b) {
-		// Try LU
-		final LU<Double> lu = LU.newSparseR064();
-
-		if (lu.decompose(A) && lu.isSolvable()) {
-			final MatrixStore<Double> x = lu.getSolution(b); // single-argument solve(rhs)
-			return R064Store.FACTORY.copy(x);
-		}
-		// Fallback QR
-//	    final QR<Double> qr = QR.R064.make();
-//	    if (qr.decompose(A) && qr.isSolvable()) {
-//	        final MatrixStore<Double> x = qr.getSolution(b);
-//	        return R064Store.FACTORY.copy(x);
-//	    }
-		throw new IllegalStateException("ojAlgo v55+: failed to solve (singular/ill-conditioned system)");
-	}
-
+	/**
+	 * <p>
+	 * Update per-layout-vertex incircle radii and total conductances.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>For each layout vertex v, compute an array
+	 * {@code inRadii[v][j] = sqrt((rv*ru*rw)/(rv+ru+rw))} for each face (triple)
+	 * adjacent to v.</li>
+	 * <li>Compute {@code conduct[v]} as the sum of edge conductances (t1+t2)/(rv +
+	 * r_w) over petals.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * These values are the geometric weights used when assembling {@code A} and the
+	 * RHS in {@code layoutCentersSolve()}. They reflect the edge-level tangency
+	 * geometry and ensure the resulting embedding respects local circle
+	 * configuration.
+	 * </p>
+	 */
 	private void updateVdata() {
 		// Compute inRadii and node conduct for each interior (layout) vertex
 		inRadii = new double[layCount][];
@@ -1246,18 +1615,47 @@ public class GOPackerEngine {
 		}
 	}
 
+	/**
+	 * <p>
+	 * Set {@code localRadii} to effective radii derived from current centers.
+	 * </p>
+	 *
+	 * <p>
+	 * What:
+	 * </p>
+	 * <ul>
+	 * <li>For interior layout vertices: compute sector areas from neighboring
+	 * centers and set r_eff = sqrt(area / (vAims(v)/2)) when the target aim
+	 * indicates adjustment.</li>
+	 * <li>For boundary vertices: compute wedge areas and angle sums over the open
+	 * boundary flower and update radii only when aims indicate (GO-style) boundary
+	 * adjustment; otherwise optionally skip (classical MAX_PACK keeps boundary
+	 * radii frozen).</li>
+	 * <li>Includes damping/clamping safeguards to avoid large per-iteration jumps
+	 * that destabilize packing.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Why:
+	 * </p>
+	 * <p>
+	 * Effective radii allow radii to adapt to geometric layout so that target
+	 * angle-sums (or target areas) are better satisfied. Moderation (damping/clamp)
+	 * keeps iteration stable on small or noisy meshes.
+	 * </p>
+	 */
 	private void setEffectiveRadii() {
 		// interior adjustments: sector-area sum vs target area (aim/2)
 		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
 			double targetArea = vAims[v] / 2.0;
-			if (targetArea <= 1e-3)
+			if (targetArea <= 1e-3) {
 				continue;
+			}
 			double area = sectorAreaAt(v);
 			localRadii[v] = Math.sqrt(Math.max(0.0, area / targetArea));
 		}
 		// boundary adjustments (bdry aims <= 0 typically)
-		double EPS = 1e-12;
 		for (int k = 0; k < bdryCount; k++) {
 			int w = bdryListClosed[k];
 			double targetArea = vAims[w] / 2.0;
@@ -1287,7 +1685,9 @@ public class GOPackerEngine {
 	}
 
 	private double hyp(int a, int b) {
-		return Math.hypot(localCentersX[a] - localCentersX[b], localCentersY[a] - localCentersY[b]);
+		double dx = localCentersX[a] - localCentersX[b];
+		double dy = localCentersY[a] - localCentersY[b];
+		return Math.sqrt(dx * dx + dy * dy);
 	}
 
 	private double sectorAreaAt(int v) {
@@ -1298,9 +1698,21 @@ public class GOPackerEngine {
 		for (int j = 0; j < m; j++) {
 			int jr = fl.get(j);
 			int jl = fl.get((j + 1) % m);
-			double ang = MathUtil.angleAtCorner(zx, zy, localCentersX[jr], localCentersY[jr], localCentersX[jl], localCentersY[jl]);
-			double r = 0.5 * (Math.hypot(localCentersX[jr] - zx, localCentersY[jr] - zy) + Math.hypot(localCentersX[jl] - zx, localCentersY[jl] - zy)
-					- Math.hypot(localCentersX[jr] - localCentersX[jl], localCentersY[jr] - localCentersY[jl]));
+
+			double xjr = localCentersX[jr], yjr = localCentersY[jr];
+			double xjl = localCentersX[jl], yjl = localCentersY[jl];
+
+			double dxr = xjr - zx, dyr = yjr - zy;
+			double dxl = xjl - zx, dyl = yjl - zy;
+			double dxrl = xjr - xjl, dyrl = yjr - yjl;
+
+			double ang = MathUtil.angleAtCorner(zx, zy, xjr, yjr, xjl, yjl);
+
+			double a = Math.sqrt(dxr * dxr + dyr * dyr);
+			double b = Math.sqrt(dxl * dxl + dyl * dyl);
+			double c = Math.sqrt(dxrl * dxrl + dyrl * dyrl);
+
+			double r = 0.5 * (a + b - c);
 			area += 0.5 * r * r * ang;
 		}
 		return area;
@@ -1309,8 +1721,9 @@ public class GOPackerEngine {
 	private double updateVisErrorMonitor() {
 		double[] ve = visualErrors();
 		double max = 0.0;
-		for (double x : ve)
+		for (double x : ve) {
 			max = Math.max(max, x);
+		}
 		visErrMonitor.add(max);
 		return max;
 	}

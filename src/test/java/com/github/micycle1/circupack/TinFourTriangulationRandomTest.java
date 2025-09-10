@@ -39,7 +39,7 @@ public class TinFourTriangulationRandomTest {
 	@Test
 	void pack() {
 		var t = buildRandomTIN(15, 15, 1337, 0.25);
-		GOPackerEngine e = new GOPackerEngine(t);
+		CircuPacker e = new CircuPacker(t);
 		e.initialize();
 //		e.pruneOrphans(); 
 		e.riffle(20);

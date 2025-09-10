@@ -84,15 +84,17 @@ public class TinfourTriangulation implements Triangulation {
 		// position of each boundary vertex in the loop
 		int[] pos = new int[vertices.size()];
 		Arrays.fill(pos, -1);
-		for (int i = 0; i < m; i++)
+		for (int i = 0; i < m; i++) {
 			pos[boundary.get(i)] = i;
+		}
 
 		for (int i = 0; i < m; i++) {
 			int w = boundary.get(i);
 			List<Integer> nbrs = new ArrayList<>(flowers.get(w)); // currently CCW-sorted
 			int deg = nbrs.size();
-			if (deg < 2)
+			if (deg < 2) {
 				continue;
+			}
 
 			int prev = boundary.get((i - 1 + m) % m);
 			int next = boundary.get((i + 1) % m);
@@ -131,17 +133,20 @@ public class TinfourTriangulation implements Triangulation {
 		while (k != to) {
 			k = (k + step + n) % n;
 			arc.add(nbrs.get(k));
-			if (arc.size() > n + 2)
+			if (arc.size() > n + 2) {
 				break; // safety
+			}
 		}
 		return arc;
 	}
 
 	private int countInterior(List<Integer> arc) {
 		int c = 0;
-		for (int u : arc)
-			if (!isBoundary.get(u))
+		for (int u : arc) {
+			if (!isBoundary.get(u)) {
 				c++;
+			}
+		}
 		return c;
 	}
 
@@ -160,7 +165,6 @@ public class TinfourTriangulation implements Triangulation {
 	public List<Integer> getFlower(int v) {
 		return flowers.get(v);
 	}
-
 	@Override
 	public boolean isBoundaryVertex(int v) {
 		return isBoundary.get(v);
@@ -210,10 +214,9 @@ public class TinfourTriangulation implements Triangulation {
 		List<Vertex> neighbors = new ArrayList<>();
 		e.pinwheel().forEach(ne -> {
 			Vertex B = ne.getB();
-			if (B == null || B.isSynthetic())
-				return; // ghost / synthetic
-			if (!indexOf.containsKey(B))
+			if (B == null || B.isSynthetic() || !indexOf.containsKey(B)) {
 				return;
+			}
 			neighbors.add(B);
 		});
 
