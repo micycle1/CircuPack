@@ -1,4 +1,4 @@
-package com.github.micycle1.circupack;
+package com.github.micycle1.circupack.triangulation;
 
 import java.util.List;
 

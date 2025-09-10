@@ -3,7 +3,6 @@ package com.github.micycle1.circupack;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -15,6 +14,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.tinfour.common.IIncrementalTin;
 import org.tinfour.common.Vertex;
 import org.tinfour.standard.IncrementalTin;
+
+import com.github.micycle1.circupack.CircuPacker;
+import com.github.micycle1.circupack.triangulation.TinfourTriangulation;
 
 public class TinFourTriangulationRandomTest {
 
@@ -41,10 +43,7 @@ public class TinFourTriangulationRandomTest {
 		var t = buildRandomTIN(15, 15, 1337, 0.25);
 		CircuPacker e = new CircuPacker(t);
 		e.initialize();
-//		e.pruneOrphans(); 
 		e.riffle(20);
-		double[] vis = e.visualErrors();
-		System.out.println(Arrays.toString(vis));
 		e.writeBackToTriangulation();
 	}
 

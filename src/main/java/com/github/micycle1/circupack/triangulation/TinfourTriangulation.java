@@ -1,4 +1,4 @@
-package com.github.micycle1.circupack;
+package com.github.micycle1.circupack.triangulation;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -150,6 +150,19 @@ public class TinfourTriangulation implements Triangulation {
 		return c;
 	}
 
+//	@Override
+//	public double[] getRadii() {
+//		double[] radii = new double[getVertexCount()];
+//		for (int i = 0; i < radii.length; i++) {
+//			radii[i] = i;
+//		}
+//
+//		for (int i = 0; i < getVertexCount(); i++) {
+//			radii[i] = isBoundary.get(i) ? Math.random():1;
+//		}
+//		return radii;
+//	}
+
 	@Override
 	public int getVertexCount() {
 		return vertices.size();
@@ -165,6 +178,7 @@ public class TinfourTriangulation implements Triangulation {
 	public List<Integer> getFlower(int v) {
 		return flowers.get(v);
 	}
+
 	@Override
 	public boolean isBoundaryVertex(int v) {
 		return isBoundary.get(v);
@@ -228,7 +242,7 @@ public class TinfourTriangulation implements Triangulation {
 		return neighbors.stream().map(v -> indexOf.get(v)).toList();
 	}
 
-	static boolean isCCW(List<Vertex> ring) {
+	public static boolean isCCW(List<Vertex> ring) {
 		int n = ring.size();
 
 		double x0 = ring.get(0).getX();

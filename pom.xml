@@ -4,7 +4,14 @@
 	<groupId>com.github.micycle1</groupId>
 	<artifactId>circupack</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
+	<packaging>jar</packaging>
 	<name>CircuPack</name>
+	<description>Computes Euclidean circle packings from triangulations.</description>
+	<url>https://github.com/micycle1/CircuPack</url>
+
+	<properties>
+		<surefire.useModulePath>false</surefire.useModulePath>
+	</properties>
 
 	<build>
 		<plugins>
@@ -36,6 +43,7 @@
 				<version>3.11.3</version>
 				<configuration>
 					<failOnError>false</failOnError>
+					<excludePackageNames>com.github.micycle1.circupack.linalg*</excludePackageNames>
 				</configuration>
 				<executions>
 					<execution>

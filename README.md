@@ -2,12 +2,12 @@
 
 **Define tangencies. Get precise circle packings.**
 
-A robust Java library that computes Euclidean circle packings from triangulations. Ported from Gerald Orick’s [GOPack](https://github.com/kensmath/GOPack) for accuracy and reliability.
+A robust Java library that computes Euclidean circle packings from triangulations. Inspired by Gerald Orick’s [GOPack](https://github.com/kensmath/GOPack).
 
 <p align="center">
     <img src="resources/poisson_pack.png" width="31%" height="auto" >
     <img src="resources/hex_pack.png" width="31%" height="auto">
-    <img src="resources/nrooks_pack.png" width="31%" height="auto">
+    <img src="resources/10k.png" width="31%" height="auto">
 </p>
 
 ## Core Idea
@@ -19,8 +19,8 @@ Supply a `Triangulation` that defines *which circles are tangent to which*. Circ
 
 *   **Simple Input:** Implement the `Triangulation` interface to define your graph of tangencies.
 *   **Automatic Geometry:** No need to guess positions or sizes. The engine computes everything.
-*   **Multiple Layouts:** Pack into a disc (MAX_PACK), a custom polygon, or a rectangle.
-*   **Production-Ready:** Built-in numerical safeguards for stable, reliable results.
+*   **Multiple Layouts:** Pack into a disc (MAX_PACK), a custom polygon, or a rectangle [WIP🚧].
+*   **Production-Ready:** Stable, reliable and fast (10k circles in ~1s).
 
 
 ## Quick Start
@@ -36,7 +36,8 @@ CircuPacker packer = new CircuPacker(tri);
 packer.initialize();
 
 // 3. Compute the packing
-packer.riffle(10); // Iterate upto 10 times for high precision
+double maxError = 0.01; // max visual error (overlap, as a fraction of circle radius)
+packer.riffle(maxError); // Iterate until max error is below threshold
 
 // 4. Retrieve results
 double[] radii = packer.getRadii();

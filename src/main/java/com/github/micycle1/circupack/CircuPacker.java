@@ -13,10 +13,15 @@ import java.util.stream.Collectors;
 import org.ejml.data.DMatrixRMaj;
 import org.ejml.data.DMatrixSparseCSC;
 import org.ejml.data.DMatrixSparseTriplet;
-import org.ejml.interfaces.linsol.LinearSolverSparse;
 import org.ejml.ops.DConvertMatrixStruct;
 import org.ejml.sparse.FillReducing;
 import org.ejml.sparse.csc.factory.LinearSolverFactory_DSCC;
+
+import com.github.micycle1.circupack.linalg.AMG;
+import com.github.micycle1.circupack.linalg.BiCGStabSolver;
+import com.github.micycle1.circupack.linalg.Preconditioner;
+import com.github.micycle1.circupack.linalg.BiCGStabSolver.SparseCSR;
+import com.github.micycle1.circupack.triangulation.Triangulation;
 
 /**
  * <p>
@@ -397,36 +402,23 @@ public class CircuPacker {
 		System.out.printf("Expected interior center from rims only: (%.8f, %.8f)\n", sumBx, sumBy);
 	}
 
-	private void debugBoundaryStats() {
-		double min = 1e9, max = -1e9, sum = 0;
-		for (int i = 0; i < bdryCount; i++) {
-			double r = localRadii[bdryListClosed[i]];
-			min = Math.min(min, r);
-			max = Math.max(max, r);
-			sum += r;
-		}
-		System.out.printf("bdry r: min=%.6g max=%.6g mean=%.6g%n", min, max, sum / bdryCount);
-	}
-
-	public int riffle(int passNum) {
-//		if (passNum <= 0) {
-//			layoutBoundary();
-//			layoutCentersSolve();
-//			updateVisErrorMonitor();
-//			return 0;
-//		}
-
-		double cutval = 0.1; // 1% of radius
+	/**
+	 * 
+	 * @param maxRelativeError in practice a lot visually lower!
+	 * @return
+	 */
+	public int riffle(double maxRelativeError) {
+		// TODO max raw/pixel error
+		maxRelativeError = Math.max(1e-4, maxRelativeError); // floor at 1e-4 (0.1%)
 		int pass = 0;
-		double maxVis = 2 * cutval;
+		double maxVis = Double.MAX_VALUE;
 
-		while (pass < passNum && maxVis > cutval) {
+		while (maxVis > maxRelativeError) {
 			layoutBoundary(); // set boundary centers (and possibly scale radii)
 			layoutCentersSolveFast(); // solve A * Z = rhs for interior centers
 			setEffectiveRadii(); // update effective radii
 			maxVis = updateVisErrorMonitor();
 			pass++;
-			System.out.print(".");
 		}
 		radii = localRadii.clone();
 		centersX = localCentersX.clone();
@@ -500,7 +492,7 @@ public class CircuPacker {
 			for (int w : flower) {
 				double dx = zvx - localCentersX[w];
 				double dy = zvy - localCentersY[w];
-				double cdiff = Math.hypot(dx, dy);
+				double cdiff = Math.sqrt(dx * dx + dy * dy);
 				double rdiff = rv + localRadii[w];
 				double me = Math.abs(cdiff - rdiff) / Math.max(1e-16, rv);
 				if (me > maxErr) {
@@ -1310,7 +1302,7 @@ public class CircuPacker {
 			int a = cornerList.get(i);
 			int b = cornerList.get((i + 1) % m);
 			int ia = loop.indexOf(a);
-			int ib = loop.indexOf(b);
+//			int ib = loop.indexOf(b);
 			List<Integer> side = new ArrayList<>();
 			side.add(a);
 			int k = ia;
@@ -1329,159 +1321,124 @@ public class CircuPacker {
 		return result;
 	}
 
-	private DMatrixRMaj solveSparseSystem(DMatrixSparseCSC A, DMatrixRMaj b) {
-		LinearSolverSparse<DMatrixSparseCSC, DMatrixRMaj> solver = LinearSolverFactory_DSCC.lu(FillReducing.NONE);
-		if (!solver.setA(A)) {
-			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
-		}
-		DMatrixRMaj x = new DMatrixRMaj(A.numCols, 1);
-		solver.solve(b, x);
-		return x;
-	}
-
-	/**
-	 * <p>
-	 * Compute interior centers by solving a Tutte-style sparse linear system.
-	 * </p>
-	 *
-	 * <p>
-	 * What (high-level):
-	 * </p>
-	 * <ol>
-	 * <li>Update local geometric precomputations via {@code updateVdata()}
-	 * (incircle radii and per-node conductances) for the current
-	 * {@code localRadii}.</li>
-	 * <li>Assemble a sparse m×m matrix {@code A} and two RHS vectors {@code bx} and
-	 * {@code by} (for X and Y coordinates) where m = number of
-	 * {@code layoutVerts}.</li>
-	 * <li>Solve two real sparse systems {@code A * zx = bx} and {@code A * zy = by}
-	 * to obtain the complex centers Z = zx + i zy at the layout vertices.</li>
-	 * <li>Write the solved coordinates back into {@code localCentersX/Y} for the
-	 * layout vertices.</li>
-	 * </ol>
-	 *
-	 * <p>
-	 * What (detailed assembly & math):
-	 * </p>
-	 * <p>
-	 * For each layout vertex v (sequential index i):
-	 * </p>
-	 * <ul>
-	 * <li>We set the diagonal entry A[i,i] = -1.0.</li>
-	 * <li>For each petal neighbor w in the flower of v, compute two adjacent
-	 * incircle radii t1,t2 from {@code inRadii[v]} and form the edge weight</li>
-	 * </ul>
-	 *
-	 * <pre>
-	 * weight = ((t1 + t2) / (r_v + r_w)) / conduct(v)
-	 * </pre>
-	 * <p>
-	 * where r_v and r_w are the current {@code localRadii} and {@code conduct(v)}
-	 * is the precomputed total conductance for v. If w is another layout vertex we
-	 * insert A[i, idx(w)] += weight; if w is a rim vertex we instead accumulate
-	 * contribution to the RHS:
-	 * </p>
-	 *
-	 * <pre>
-	 *   bx[i] += -weight * X_w
-	 *   by[i] += -weight * Y_w
-	 * </pre>
-	 *
-	 * <p>
-	 * Why the normalization by conduct(v)?
-	 * </p>
-	 * <p>
-	 * Dividing by the node conductance ensures the row sums of off-diagonal weights
-	 * reflect the random-walk style transition probabilities used in the original
-	 * GO approach and yields a well-scaled, diagonally-dominant system with the -1
-	 * diagonal.
-	 * </p>
-	 *
-	 * <p>
-	 * Implementation/practical notes:
-	 * </p>
-	 * <ul>
-	 * <li>We build {@code A} using a triplet builder ({@code DMatrixSparseTriplet})
-	 * and then convert to CSC ({@code DMatrixSparseCSC}) for the sparse solver —
-	 * this avoids repeated in-place additions that are expensive on CSC.</li>
-	 * <li>We split the complex unknown into two real solves (X and Y). This is
-	 * numerically equivalent to solving a complex system but leverages mature
-	 * sparse real solvers in EJML.</li>
-	 * <li>We apply small numerical safeguards: clamp denominators, avoid zero
-	 * conductances, and skip degenerate incircle values. If a row appears singular
-	 * the sparse solver will throw and calling code should inspect combinatorics
-	 * and radii for degeneracy.</li>
-	 * <li>Cost: assembly visits each interior petal once (O(sum deg(v))) and
-	 * solving cost depends on sparse factorization (typically near-linear for
-	 * planar graphs). Memory is O(n + nnz(A)).</li>
-	 * </ul>
-	 *
-	 * <p>
-	 * Why:
-	 * </p>
-	 * <p>
-	 * Tutte-style linear embedding with these geometrically derived weights
-	 * reproduces the GO embedding method: boundary centers act as fixed Dirichlet
-	 * values while interior centers are harmonic averages with weights determined
-	 * by the circle-in-circle geometry, producing visually faithful packings
-	 * consistent with target angle/area aims.
-	 * </p>
-	 */
-	private void layoutCentersSolve() {
+	private void layoutCentersSolveFast() {
 		updateVdata();
 
-		int estNnz = 0;
-		for (int i = 0; i < layCount; i++) {
-			int v = layoutVerts[i];
-			estNnz += tri.getFlower(v).size() + 1;
-		}
+		int n = layCount;
 
-		// Triplet builder for A
-		DMatrixSparseTriplet Atr = new DMatrixSparseTriplet(layCount, layCount, estNnz);
-		double[] bx = new double[layCount];
-		double[] by = new double[layCount];
+		// First pass: count nnz per row (we always add diagonal)
+		int[] rowCounts = new int[n];
+		Arrays.fill(rowCounts, 1); // diagonal per row
+		double[] bx = new double[n];
+		double[] by = new double[n];
 
-		for (int i = 0; i < layCount; i++) {
+		for (int i = 0; i < n; i++) {
 			int v = layoutVerts[i];
 			double vrad = localRadii[v];
 			var fl = tri.getFlower(v);
 			int m = fl.size();
+			if (m == 0) {
+				continue;
+			}
+
 			double[] iR = inRadii[i];
-			double totalCond = Math.max(1e-16, conduct[i]);
+			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
 
-			// diagonal
-			Atr.addItem(i, i, -1.0);
-
+			double prevR = iR[m - 1];
 			for (int j = 0; j < m; j++) {
 				int w = fl.get(j);
-				double t1 = iR[(j - 1 + m) % m];
-				double t2 = iR[j];
-				double coeff = ((t1 + t2) / Math.max(1e-16, (vrad + localRadii[w]))) / totalCond;
+				double coeff = (prevR + iR[j]) * invTot / Math.max(1e-16, vrad + localRadii[w]);
+				prevR = iR[j];
 
 				int idxW = v2indx[w];
-				if (0 <= idxW && idxW < layCount) {
-					Atr.addItem(i, idxW, coeff);
+				if (0 <= idxW && idxW < n) {
+					rowCounts[i]++; // internal neighbor contributes to A
 				} else {
-					bx[i] += -coeff * localCentersX[w];
-					by[i] += -coeff * localCentersY[w];
+					// external neighbor contributes to RHS
+					bx[i] -= coeff * localCentersX[w];
+					by[i] -= coeff * localCentersY[w];
 				}
 			}
 		}
 
-		DMatrixSparseCSC A = DConvertMatrixStruct.convert(Atr, (DMatrixSparseCSC) null);
-		DMatrixRMaj rhsX = new DMatrixRMaj(bx.length, 1, true, bx);
-		DMatrixRMaj rhsY = new DMatrixRMaj(by.length, 1, true, by);
-		DMatrixRMaj solX = solveSparseSystem(A, rhsX);
-		DMatrixRMaj solY = solveSparseSystem(A, rhsY);
+		// Build CSR structure
+		int[] rowPtr = new int[n + 1];
+		rowPtr[0] = 0;
+		for (int i = 0; i < n; i++) {
+			rowPtr[i + 1] = rowPtr[i] + rowCounts[i];
+		}
+		int nnz = rowPtr[n];
+		int[] colIdx = new int[nnz];
+		double[] val = new double[nnz];
+		double[] Minv = new double[n];
 
-		for (int i = 0; i < layCount; i++) {
+		// Second pass: fill values
+		int[] next = new int[n];
+		System.arraycopy(rowPtr, 0, next, 0, n);
+
+		for (int i = 0; i < n; i++) {
+			// Put diagonal first
+			int pos = next[i]++;
+			colIdx[pos] = i;
+			val[pos] = -1.0; // your system has diagonal -1
+			Minv[i] = -1.0 != 0.0 ? 1.0 / (-1.0) : 1.0; // Jacobi inverse
+
 			int v = layoutVerts[i];
-			localCentersX[v] = solX.get(i);
-			localCentersY[v] = solY.get(i);
+			double vrad = localRadii[v];
+			var fl = tri.getFlower(v);
+			int m = fl.size();
+			if (m == 0) {
+				continue;
+			}
+
+			double[] iR = inRadii[i];
+			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
+
+			double prevR = iR[m - 1];
+			for (int j = 0; j < m; j++) {
+				int w = fl.get(j);
+				double coeff = (prevR + iR[j]) * invTot / Math.max(1e-16, vrad + localRadii[w]);
+				prevR = iR[j];
+
+				int idxW = v2indx[w];
+				if (0 <= idxW && idxW < n) {
+					int p = next[i]++;
+					colIdx[p] = idxW;
+					val[p] = coeff;
+				} else {
+					// already accounted in bx/by in first pass
+				}
+			}
+		}
+
+		SparseCSR A = new SparseCSR(n, nnz, rowPtr, colIdx, val, Minv);
+
+		Preconditioner precond;
+//		precond = new SSOR(A.n, A.rowPtr, A.colIdx, A.val, 1.333);
+//		precond = Jacobi.fromConstantDiagonal(A.n, -1.0); // fastest (~2x)
+		precond = new AMG(A.n, A.rowPtr, A.colIdx, A.val);
+//		precond = new ILU0(A.n, A.rowPtr, A.colIdx, A.val);
+
+		double tol = 1e-5; // NOTE magic constant. seems sufficient...
+		int maxIters = Math.max(1000, 10 * A.n);
+
+		double[] solx = new double[A.n];
+		double[] soly = new double[A.n];
+
+		BiCGStabSolver.Result rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, precond);
+		BiCGStabSolver.Result ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, precond);
+
+		// Copy results back
+		for (int i = 0; i < n; i++) {
+			int v = layoutVerts[i];
+			localCentersX[v] = solx[i];
+			localCentersY[v] = soly[i];
 		}
 	}
 
-	private void layoutCentersSolveFast() {
+	// Compute interior centers by solving a Tutte-style sparse linear system.
+	@Deprecated // original, slower solution
+	private void layoutCentersSolve() {
 		updateVdata();
 
 		int estNnz = 0;
@@ -1540,7 +1497,7 @@ public class CircuPacker {
 		}
 
 		// one LU factorisation – two solves
-		var solver = LinearSolverFactory_DSCC.lu(FillReducing.IDENTITY);
+		var solver = LinearSolverFactory_DSCC.lu(FillReducing.IDENTITY); // ideally AMD
 		if (!solver.setA(A)) {
 			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
 		}

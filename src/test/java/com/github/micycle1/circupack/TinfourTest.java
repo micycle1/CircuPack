@@ -12,6 +12,8 @@ import org.tinfour.common.IIncrementalTin;
 import org.tinfour.common.Vertex;
 import org.tinfour.standard.IncrementalTin;
 
+import com.github.micycle1.circupack.triangulation.TinfourTriangulation;
+
 public class TinfourTest {
 
 	@Test
