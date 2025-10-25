@@ -16,13 +16,13 @@ import org.tinfour.common.Vertex;
 
 public class TinfourTriangulation implements Triangulation {
 
-	final IIncrementalTin tin;
-	final List<Vertex> vertices;
-	final List<Integer> boundary;
-	final List<Integer> interiorVertices;
-	final BitSet isBoundary;
-	final HashMap<Vertex, Integer> indexOf;
-	final List<List<Integer>> flowers;
+	protected final IIncrementalTin tin;
+	protected final List<Vertex> vertices;
+	protected final List<Integer> boundary;
+	protected final List<Integer> interiorVertices;
+	protected final BitSet isBoundary;
+	protected final HashMap<Vertex, Integer> indexOf;
+	protected final List<List<Integer>> flowers;
 
 	public TinfourTriangulation(IIncrementalTin tin) {
 		this.tin = tin;

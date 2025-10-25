@@ -98,6 +98,8 @@ import com.github.micycle1.circupack.triangulation.Triangulation;
  * </ul>
  */
 public class CircuPacker {
+	
+	private static final int MAX_ITER = 50;
 
 	// External triangulation (combinatorics and optional geometry)
 	private final Triangulation tri;
@@ -413,7 +415,7 @@ public class CircuPacker {
 		int pass = 0;
 		double maxVis = Double.MAX_VALUE;
 
-		while (maxVis > maxRelativeError) {
+		while (maxVis > maxRelativeError && pass < MAX_ITER) {
 			layoutBoundary(); // set boundary centers (and possibly scale radii)
 			layoutCentersSolveFast(); // solve A * Z = rhs for interior centers
 			setEffectiveRadii(); // update effective radii
@@ -1419,7 +1421,7 @@ public class CircuPacker {
 		precond = new AMG(A.n, A.rowPtr, A.colIdx, A.val);
 //		precond = new ILU0(A.n, A.rowPtr, A.colIdx, A.val);
 
-		double tol = 1e-5; // NOTE magic constant. seems sufficient...
+		double tol = 1e-7; // NOTE magic constant. seems sufficient...
 		int maxIters = Math.max(1000, 10 * A.n);
 
 		double[] solx = new double[A.n];

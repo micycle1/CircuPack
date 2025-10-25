@@ -3,16 +3,24 @@ package com.github.micycle1.circupack.triangulation;
 import java.util.List;
 
 /**
- * Triangulation: minimal combinatorial + optional geometric interface required
- * by GOPacker-like code.
- *
- * Conventions: - Vertex indices are 0..n-1 (0-based). - For each vertex v,
- * getFlower(v) returns neighbors in COUNTER-CLOCKWISE order. * interior vertex:
- * flower is cyclic (length = degree). Do NOT repeat first at end. * boundary
- * vertex: flower is open (first != last). - getBoundaryLoop() returns
- * CCW-ordered boundary vertices, each exactly once; return null or an empty
- * array to indicate a sphere (no boundary).
- *
+ * Triangulation: a minimal combinatorial + optional geometric interface
+ * required by Circupack.
+ * <p>
+ * Conventions:
+ * <ul>
+ * <li>Vertex indices are 0..n-1 (0-based).</li>
+ * <li>For each vertex v, getFlower(v) returns neighbors in COUNTER-CLOCKWISE
+ * order.
+ * <ul>
+ * <li>interior vertex: flower is cyclic (length = degree). Do NOT repeat first
+ * at end.</li>
+ * <li>boundary vertex: flower is open (first != last).</li>
+ * </ul>
+ * </li>
+ * <li>getBoundaryLoop() returns CCW-ordered boundary vertices, each exactly
+ * once; return null or an empty array to indicate a sphere (no boundary).</li>
+ * </ul>
+ * <p>
  * Non-MAX_PACK / optional methods default to null/false/do-nothing via default
  * implementations.
  */
@@ -39,8 +47,8 @@ public interface Triangulation {
 	 * to first), so we cover only the interior wedge. it must start at prevBoundary
 	 * and end at nextBoundary.
 	 * <p>
-	 * For each boundary v, getFlower(v) should be exactly [prev, center,
-	 * next] in CCW order.
+	 * For each boundary v, getFlower(v) should be exactly [prev, center, next] in
+	 * CCW order.
 	 */
 	List<Integer> getFlower(int v);
 
@@ -92,7 +100,8 @@ public interface Triangulation {
 	 * arrays.
 	 */
 	default void setCenters(double[] centersX, double[] centersY) {
-		/* no-op by default */ }
+		/* no-op by default */
+	}
 
 	/** True if centers present. Default false. */
 	default boolean hasCenters() {
@@ -106,7 +115,8 @@ public interface Triangulation {
 
 	/** Set radii: default no-op. */
 	default void setRadii(double[] radii) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	/**
 	 * vAims: target angle-sum array length n or null if omitted. Default: null
@@ -118,7 +128,8 @@ public interface Triangulation {
 
 	/** Set vAims: default no-op. */
 	default void setVAims(double[] vAims) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	/** True if vAims present. Default false. */
 	default boolean hasVAims() {
@@ -145,7 +156,8 @@ public interface Triangulation {
 
 	/** Set gamma: default no-op. */
 	default void setGamma(int gamma) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	// ----------------------
 	// Polygon / rectangular support (defaults: not provided)
@@ -158,7 +170,8 @@ public interface Triangulation {
 
 	/** Set corners: default no-op. */
 	default void setCorners(List<Integer> corners) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	/**
 	 * Sides for polygonal mode: list of CCW lists of vertex indices (each includes
@@ -170,7 +183,8 @@ public interface Triangulation {
 
 	/** Set sides: default no-op. */
 	default void setSides(List<List<Integer>> sides) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	/** Auxiliary vlist: default null. */
 	default List<Integer> getVlist() {
@@ -179,7 +193,8 @@ public interface Triangulation {
 
 	/** Set vlist: default no-op. */
 	default void setVlist(List<Integer> vlist) {
-		/* no-op */ }
+		/* no-op */
+	}
 
 	// ----------------------
 	// Mode / hints (default: MAX_PACK)
@@ -196,5 +211,6 @@ public interface Triangulation {
 
 	/** Set mode: default no-op. */
 	default void setMode(Mode mode) {
-		/* no-op */ }
+		/* no-op */
+	}
 }
