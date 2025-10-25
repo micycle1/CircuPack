@@ -1,3 +1,4 @@
+[![](https://jitpack.io/v/micycle1/CircuPack.svg)](https://jitpack.io/#micycle1/CircuPack)
 # CircuPack
 
 **Define tangencies. Get precise circle packings.**
