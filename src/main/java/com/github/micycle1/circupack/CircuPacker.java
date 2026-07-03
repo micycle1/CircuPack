@@ -12,7 +12,6 @@ import java.util.stream.Collectors;
 
 import com.github.micycle1.circupack.linalg.AMG;
 import com.github.micycle1.circupack.linalg.BiCGStabSolver;
-import com.github.micycle1.circupack.linalg.Preconditioner;
 import com.github.micycle1.circupack.linalg.BiCGStabSolver.SparseCSR;
 import com.github.micycle1.circupack.triangulation.Triangulation;
 
@@ -56,7 +55,16 @@ public class CircuPacker {
 		MAX_PACK, POLYGONAL
 	}
 
-	private static final int MAX_ITER = 200;
+	private static final int MAX_ITER = 500;
+
+	// Inner linear-solve tolerance bounds: during riffle the tolerance tracks the
+	// outer visual error (solving tighter than the current geometry warrants is
+	// wasted work); the final solve always uses TOL_FLOOR.
+	private static final double TOL_FLOOR = 1e-7;
+	private static final double TOL_CEIL = 1e-3;
+	// Rebuild the AMG preconditioner after this many passes even if iteration
+	// counts stay healthy.
+	private static final int AMG_MAX_AGE = 15;
 
 	// External triangulation (combinatorics)
 	private final Triangulation tri;
@@ -131,6 +139,15 @@ public class CircuPacker {
 
 	// Monitoring
 	private final List<Double> visErrMonitor = new ArrayList<>();
+
+	// Solver state carried across riffle passes: the AMG preconditioner is reused
+	// while the matrix values drift slowly (staleness only affects iteration
+	// count, never correctness), and the last outer visual error drives the
+	// adaptive inner tolerance.
+	private AMG cachedAMG;
+	private int amgAge;
+	private int amgBaselineIters = -1;
+	private double lastMaxVisErr = Double.MAX_VALUE;
 
 	/**
 	 * Builds the engine from the given triangulation: classifies
@@ -359,16 +376,17 @@ public class CircuPacker {
 
 		while (maxVis > maxRelativeError && pass < MAX_ITER) {
 			layoutBoundary();
-			layoutCentersSolve();
+			layoutCentersSolve(adaptiveTol());
 			setEffectiveRadii();
 
 			maxVis = updateVisErrorMonitor();
+			lastMaxVisErr = maxVis;
 			pass++;
 		}
 
-		// final consistent geometry
+		// final consistent geometry, solved to full precision
 		layoutBoundary();
-		layoutCentersSolve();
+		layoutCentersSolve(TOL_FLOOR);
 
 		radii = localRadii.clone();
 		centersX = localCentersX.clone();
@@ -572,6 +590,11 @@ public class CircuPacker {
 		rimCount = rimVerts.length;
 
 		buildIndexing(); // rebuild v2indx/indx2v
+
+		// system dimension changed: the cached preconditioner no longer applies
+		cachedAMG = null;
+		amgAge = 0;
+		amgBaselineIters = -1;
 	}
 
 	/** Final radii (valid after {@link #riffle(double)}). */
@@ -1287,7 +1310,31 @@ public class CircuPacker {
 		return result;
 	}
 
-	private void layoutCentersSolve() {
+	private void rebuildAMG(SparseCSR A) {
+		cachedAMG = new AMG(A.n, A.rowPtr, A.colIdx, A.val);
+		amgAge = 0;
+		amgBaselineIters = -1;
+	}
+
+	/**
+	 * Inner-solve tolerance for the current pass: proportional to the outer
+	 * visual error (loose while the radii are still far off), clamped to
+	 * [{@code TOL_FLOOR}, {@code TOL_CEIL}].
+	 */
+	private double adaptiveTol() {
+		return Math.max(TOL_FLOOR, Math.min(TOL_CEIL, 0.01 * lastMaxVisErr));
+	}
+
+	/** Seed the solve with the previous pass's interior centers (warm start). */
+	private void seedWarmStart(double[] solx, double[] soly) {
+		for (int i = 0; i < layCount; i++) {
+			int v = layoutVerts[i];
+			solx[i] = localCentersX[v];
+			soly[i] = localCentersY[v];
+		}
+	}
+
+	private void layoutCentersSolve(double tol) {
 		updateVdata();
 
 		int n = layCount;
@@ -1379,21 +1426,40 @@ public class CircuPacker {
 
 		SparseCSR A = new SparseCSR(n, nnz, rowPtr, colIdx, val, Minv);
 
-		Preconditioner precond;
-//		precond = new SSOR(A.n, A.rowPtr, A.colIdx, A.val, 1.333);
-//		precond = Jacobi.fromConstantDiagonal(A.n, -1.0); // fastest (~2x)
-		precond = new AMG(A.n, A.rowPtr, A.colIdx, A.val);
-//		precond = new ILU0(A.n, A.rowPtr, A.colIdx, A.val);
+		// Reuse the AMG hierarchy across passes: matrix values drift slowly, so a
+		// slightly stale preconditioner still works; rebuild on age or when
+		// iteration counts creep up (flagged below).
+		if (cachedAMG == null || amgAge >= AMG_MAX_AGE) {
+			rebuildAMG(A);
+		}
 
-		double tol = 1e-7; // NOTE magic constant. seems sufficient...
 		int maxIters = Math.max(1000, 10 * A.n);
 
 		double[] solx = new double[A.n];
 		double[] soly = new double[A.n];
+		seedWarmStart(solx, soly);
 
 		// writes to solx+soly
-		BiCGStabSolver.solve(A, bx, solx, tol, maxIters, precond);
-		BiCGStabSolver.solve(A, by, soly, tol, maxIters, precond);
+		BiCGStabSolver.Result rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, cachedAMG);
+		BiCGStabSolver.Result ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, cachedAMG);
+
+		if (!rx.converged || !ry.converged) {
+			// A stale preconditioner may be at fault (or a breakdown polluted the
+			// iterate): rebuild from the current matrix and retry once from the
+			// warm start.
+			rebuildAMG(A);
+			seedWarmStart(solx, soly);
+			rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, cachedAMG);
+			ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, cachedAMG);
+		}
+
+		int iters = Math.max(rx.iters, ry.iters);
+		if (amgBaselineIters < 0) {
+			amgBaselineIters = Math.max(1, iters);
+		} else if (iters > 2 * amgBaselineIters + 5) {
+			amgAge = AMG_MAX_AGE; // convergence degrading: force rebuild next pass
+		}
+		amgAge++;
 
 		// Copy results back
 		for (int i = 0; i < n; i++) {
