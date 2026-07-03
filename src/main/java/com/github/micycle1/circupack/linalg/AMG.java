@@ -101,6 +101,18 @@ public final class AMG implements Preconditioner {
 		vcycleTop(top, r, z);
 	}
 
+	/**
+	 * Fused two-vector V-cycle: identical to calling {@link #apply} twice, but
+	 * every level's matrix is streamed once for both vectors (SpMV-type kernels
+	 * are memory-bound, so the second vector is nearly free).
+	 */
+	@Override
+	public void apply2(double[] r1, double[] r2, double[] z1, double[] z2) {
+		Arrays.fill(z1, 0.0);
+		Arrays.fill(z2, 0.0);
+		vcycleTop2(top, r1, r2, z1, z2);
+	}
+
 	// Top level: skip pre-smooth and residual SpMV
 	private void vcycleTop(Level L, double[] b, double[] x) {
 		if (L.coarse == null) {
@@ -147,6 +159,123 @@ public final class AMG implements Preconditioner {
 			prolongAdd(L, L.ec, x);
 			if (postSmooth > 0) {
 				jacobiSmooth(L, b, x, postSmooth, omega);
+			}
+		}
+	}
+
+	// ---------- Fused two-vector cycle (mirrors vcycleTop/vcycle exactly) ----------
+
+	private void vcycleTop2(Level L, double[] b1, double[] b2, double[] x1, double[] x2) {
+		if (L.coarse == null) {
+			coarseSolve2(L, b1, b2, x1, x2);
+			return;
+		}
+
+		restrictSum2(L, b1, b2, L.rc, L.rc2);
+
+		Arrays.fill(L.ec, 0.0);
+		Arrays.fill(L.ec2, 0.0);
+		vcycle2(L.coarse, L.rc, L.rc2, L.ec, L.ec2);
+
+		prolongAdd2(L, L.ec, L.ec2, x1, x2);
+
+		if (topPostSmooth > 0) {
+			jacobiSmooth2(L, b1, b2, x1, x2, topPostSmooth, omega);
+		}
+	}
+
+	private void vcycle2(Level L, double[] b1, double[] b2, double[] x1, double[] x2) {
+		if (preSmooth > 0) {
+			jacobiSmooth2(L, b1, b2, x1, x2, preSmooth, omega);
+		}
+
+		residual2(L, b1, b2, x1, x2, L.res, L.res2);
+
+		if (L.coarse == null) {
+			coarseSolve2(L, L.res, L.res2, x1, x2);
+		} else {
+			restrictSum2(L, L.res, L.res2, L.rc, L.rc2);
+			Arrays.fill(L.ec, 0.0);
+			Arrays.fill(L.ec2, 0.0);
+			vcycle2(L.coarse, L.rc, L.rc2, L.ec, L.ec2);
+			prolongAdd2(L, L.ec, L.ec2, x1, x2);
+			if (postSmooth > 0) {
+				jacobiSmooth2(L, b1, b2, x1, x2, postSmooth, omega);
+			}
+		}
+	}
+
+	// x += A^{-1} b for both vectors (coarsest level is tiny; no fusion needed)
+	private void coarseSolve2(Level L, double[] b1, double[] b2, double[] x1, double[] x2) {
+		System.arraycopy(b1, 0, L.tmp, 0, L.n);
+		L.lu.solveInPlace(L.tmp);
+		axpyInPlace(x1, L.tmp, 1.0);
+		System.arraycopy(b2, 0, L.tmp, 0, L.n);
+		L.lu.solveInPlace(L.tmp);
+		axpyInPlace(x2, L.tmp, 1.0);
+	}
+
+	private void jacobiSmooth2(Level L, double[] b1, double[] b2, double[] x1, double[] x2, int steps, double w) {
+		final int[] rp = L.rowPtr, ci = L.colIdx;
+		final double[] a = L.val, Dinv = L.Dinv;
+		for (int s = 0; s < steps; s++) {
+			for (int i = 0; i < L.n; i++) {
+				double s1 = 0.0, s2 = 0.0;
+				for (int p = rp[i], pe = rp[i + 1]; p < pe; p++) {
+					double av = a[p];
+					int c = ci[p];
+					s1 += av * x1[c];
+					s2 += av * x2[c];
+				}
+				double wd = w * Dinv[i];
+				x1[i] += wd * (b1[i] - s1);
+				x2[i] += wd * (b2[i] - s2);
+			}
+		}
+	}
+
+	private void residual2(Level L, double[] b1, double[] b2, double[] x1, double[] x2, double[] r1, double[] r2) {
+		final int n = L.n;
+		final int[] rp = L.rowPtr, ci = L.colIdx;
+		final double[] a = L.val;
+		for (int i = 0; i < n; i++) {
+			double s1 = 0.0, s2 = 0.0;
+			for (int p = rp[i], pe = rp[i + 1]; p < pe; p++) {
+				double av = a[p];
+				int c = ci[p];
+				s1 += av * x1[c];
+				s2 += av * x2[c];
+			}
+			r1[i] = b1[i] - s1;
+			r2[i] = b2[i] - s2;
+		}
+	}
+
+	private void restrictSum2(Level L, double[] rF1, double[] rF2, double[] rC1, double[] rC2) {
+		final int[] ptr = L.childPtr, idx = L.childIdx;
+		final int nc = L.nc;
+		for (int k = 0; k < nc; k++) {
+			double s1 = 0.0, s2 = 0.0;
+			for (int p = ptr[k], pe = ptr[k + 1]; p < pe; p++) {
+				int i = idx[p];
+				s1 += rF1[i];
+				s2 += rF2[i];
+			}
+			rC1[k] = s1;
+			rC2[k] = s2;
+		}
+	}
+
+	private void prolongAdd2(Level L, double[] eC1, double[] eC2, double[] xF1, double[] xF2) {
+		final int[] ptr = L.childPtr, idx = L.childIdx;
+		final int nc = L.nc;
+		for (int k = 0; k < nc; k++) {
+			double a1 = eC1[k];
+			double a2 = eC2[k];
+			for (int p = ptr[k], pe = ptr[k + 1]; p < pe; p++) {
+				int i = idx[p];
+				xF1[i] += a1;
+				xF2[i] += a2;
 			}
 		}
 	}
@@ -245,6 +374,8 @@ public final class AMG implements Preconditioner {
 			cur.childIdx = childIdx;
 			cur.rc = new double[agg.nc];
 			cur.ec = new double[agg.nc];
+			cur.rc2 = new double[agg.nc];
+			cur.ec2 = new double[agg.nc];
 			cur.coarse = nextL;
 
 			cur = nextL;
@@ -278,6 +409,7 @@ public final class AMG implements Preconditioner {
 			L.Dinv[i] = 1.0 / d;
 		}
 		L.res = new double[n];
+		L.res2 = new double[n];
 		L.tmp = new double[n];
 		return L;
 	}
@@ -288,6 +420,7 @@ public final class AMG implements Preconditioner {
 		double[] val;
 		double[] Dinv;
 		double[] res, tmp;
+		double[] res2; // second-vector workspace for apply2
 
 		// aggregation
 		int[] agg; // fine -> coarse (for completeness)
@@ -295,6 +428,7 @@ public final class AMG implements Preconditioner {
 		int[] childPtr; // P^T structure (coarse -> fine list)
 		int[] childIdx;
 		double[] rc, ec;
+		double[] rc2, ec2; // second-vector workspace for apply2
 		Level coarse;
 
 		// coarsest

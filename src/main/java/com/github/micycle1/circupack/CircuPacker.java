@@ -11,8 +11,10 @@ import java.util.Queue;
 import java.util.stream.Collectors;
 
 import com.github.micycle1.circupack.linalg.AMG;
+import com.github.micycle1.circupack.linalg.AndersonAccelerator;
 import com.github.micycle1.circupack.linalg.BiCGStabSolver;
 import com.github.micycle1.circupack.linalg.BiCGStabSolver.SparseCSR;
+import com.github.micycle1.circupack.linalg.CGSolver;
 import com.github.micycle1.circupack.triangulation.Triangulation;
 
 /**
@@ -65,6 +67,12 @@ public class CircuPacker {
 	// Rebuild the AMG preconditioner after this many passes even if iteration
 	// counts stay healthy.
 	private static final int AMG_MAX_AGE = 15;
+
+	// Anderson acceleration of the outer radii fixed point: window size, and the
+	// per-component cap (in log-radius units, so 1.0 ≈ factor e) beyond which an
+	// extrapolated step is rejected in favour of the plain one.
+	private static final int AA_DEPTH = 5;
+	private static final double AA_MAX_STEP = 1.0;
 
 	// External triangulation (combinatorics)
 	private final Triangulation tri;
@@ -119,18 +127,29 @@ public class CircuPacker {
 	private int layCount; // layout vertex count
 	private int rimCount; // rim vertex count (not including closure repetition)
 
-	// incircle radii per interior vertex (sequential ordering)
-	private double[][] inRadii; // size layCount x deg(v) for interior vertices only
-	private double[] conduct; // total conductances per interior vertex (size layCount)
+	// Flower cache: per-vertex petal arrays copied out of the Triangulation once
+	// (int[] instead of List<Integer> — the flowers are walked in every hot loop).
+	private int[][] flowers;
 
-	// Matrices and RHS data needed for layout centers
-	// We build A (m x m) sparse, b = RHS (m), where m=layCount
-	// A has -1 diagonal and off-diagonal entries are scaled weights among interior
-	// neighbors
-	// RHS sums contributions from rim neighbors.
-	// We'll build A and b on each layout step from current localRadii/localCenters.
-	// We don't store explicit "transition/rhs" topologies separately,
-	// since we can compute them deterministically from neighbors lists each time.
+	// Linear system for layout centers, in symmetrized (SPD graph-Laplacian)
+	// form: row i of the GO transition system is scaled by conduct(v) so that
+	// A = D - W with D_ii = total conductance of v and W_vw = (t1+t2)/(r_v+r_w)
+	// symmetric edge weights (t's are the incircle radii of the two faces
+	// sharing edge vw). RHS_i = sum over rim neighbors w of W_vw * center(w).
+	// This is the same solution as the original -1-diagonal transition system
+	// but symmetric positive definite, so CG applies.
+	//
+	// The sparsity pattern is fixed while the layout/rim sets are fixed, so the
+	// structure (csrRowPtr/csrColIdx, diagonal stored first per row) is built
+	// once in buildSolverPattern(); each pass only refreshes csrVal and the RHS.
+	private int[] csrRowPtr; // layCount+1
+	private int[] csrColIdx; // nnz
+	private double[] csrVal; // nnz, refreshed each pass
+	private double[] csrDiagInv; // 1/diag, refreshed each pass
+	private double[] rhsX, rhsY; // refreshed each pass
+	private double[] solX, solY; // solution buffers (warm-started)
+	private double[] faceScratch; // incircle radii around one vertex (max degree)
+
 	private Mode mode = Mode.MAX_PACK;
 
 	// For polygonal mode
@@ -148,6 +167,9 @@ public class CircuPacker {
 	private int amgAge;
 	private int amgBaselineIters = -1;
 	private double lastMaxVisErr = Double.MAX_VALUE;
+
+	// Anderson acceleration toggle (on by default); see riffle()
+	private boolean andersonAcceleration = true;
 
 	/**
 	 * Builds the engine from the given triangulation: classifies
@@ -202,6 +224,73 @@ public class CircuPacker {
 
 		// indexing arrays
 		buildIndexing();
+
+		// flower cache + fixed CSR sparsity pattern for the interior solve
+		cacheFlowers();
+		buildSolverPattern();
+	}
+
+	private void cacheFlowers() {
+		flowers = new int[n][];
+		for (int v = 0; v < n; v++) {
+			List<Integer> fl = tri.getFlower(v);
+			int m = fl.size();
+			int[] a = new int[m];
+			for (int j = 0; j < m; j++) {
+				a[j] = fl.get(j);
+			}
+			flowers[v] = a;
+		}
+	}
+
+	/**
+	 * Builds the fixed structural part of the layout linear system: CSR sparsity
+	 * pattern (diagonal first in each row, then interior petals in flower order,
+	 * matching the fill order in {@code assembleSystem}) and the per-pass value/
+	 * RHS/solution buffers. Must be re-run whenever the layout/rim sets change;
+	 * invalidates the cached preconditioner.
+	 */
+	private void buildSolverPattern() {
+		csrRowPtr = new int[layCount + 1];
+		int maxDeg = 1;
+		for (int i = 0; i < layCount; i++) {
+			int[] fl = flowers[layoutVerts[i]];
+			maxDeg = Math.max(maxDeg, fl.length);
+			int cnt = 1; // diagonal
+			for (int w : fl) {
+				int idxW = v2indx[w];
+				if (0 <= idxW && idxW < layCount) {
+					cnt++;
+				}
+			}
+			csrRowPtr[i + 1] = csrRowPtr[i] + cnt;
+		}
+
+		int nnz = csrRowPtr[layCount];
+		csrColIdx = new int[nnz];
+		csrVal = new double[nnz];
+		csrDiagInv = new double[layCount];
+		rhsX = new double[layCount];
+		rhsY = new double[layCount];
+		solX = new double[layCount];
+		solY = new double[layCount];
+		faceScratch = new double[maxDeg];
+
+		for (int i = 0; i < layCount; i++) {
+			int p = csrRowPtr[i];
+			csrColIdx[p++] = i; // diagonal first
+			for (int w : flowers[layoutVerts[i]]) {
+				int idxW = v2indx[w];
+				if (0 <= idxW && idxW < layCount) {
+					csrColIdx[p++] = idxW;
+				}
+			}
+		}
+
+		// pattern (and dimension) may have changed: cached hierarchy is invalid
+		cachedAMG = null;
+		amgAge = 0;
+		amgBaselineIters = -1;
 	}
 
 	/**
@@ -339,6 +428,17 @@ public class CircuPacker {
 	}
 
 	/**
+	 * Enables/disables Anderson acceleration of the riffle iteration (on by
+	 * default). Acceleration extrapolates the radii between passes to cut the
+	 * pass count; it never affects the converged geometry (extrapolation is
+	 * safeguarded and convergence is measured on unextrapolated passes), so
+	 * disabling is mainly useful for benchmarking or debugging.
+	 */
+	public void setAndersonAcceleration(boolean enabled) {
+		this.andersonAcceleration = enabled;
+	}
+
+	/**
 	 * The CCW-ordered corner vertices in use for polygonal packing, or null in
 	 * MAX_PACK mode. Useful when corners were auto-chosen.
 	 */
@@ -374,7 +474,23 @@ public class CircuPacker {
 		int pass = 0;
 		double maxVis = Double.MAX_VALUE;
 
+		// Anderson acceleration of the radii fixed point r <- g(r), where g is
+		// one riffle pass. The state is log-radii: extrapolated radii stay
+		// positive, and the per-pass renormalisation (all radii divided by a
+		// common factor) becomes an additive shift the least-squares handles.
+		// Extrapolation only alters the radii the NEXT pass starts from;
+		// convergence is always measured on the plain (unextrapolated) state, so
+		// the loop exits with genuine riffle geometry.
+		final int nr = localRadii.length;
+		AndersonAccelerator aa = andersonAcceleration ? new AndersonAccelerator(AA_DEPTH, AA_MAX_STEP) : null;
+		double[] u = aa != null ? new double[nr] : null;
+		double[] gu = aa != null ? new double[nr] : null;
+
 		while (maxVis > maxRelativeError && pass < MAX_ITER) {
+			if (aa != null) {
+				copyLogRadii(u);
+			}
+
 			layoutBoundary();
 			layoutCentersSolve(adaptiveTol());
 			setEffectiveRadii();
@@ -382,6 +498,16 @@ public class CircuPacker {
 			maxVis = updateVisErrorMonitor();
 			lastMaxVisErr = maxVis;
 			pass++;
+
+			if (aa != null && maxVis > maxRelativeError && pass < MAX_ITER) {
+				copyLogRadii(gu);
+				double[] acc = aa.next(u, gu);
+				if (acc != gu) { // identity return means "take the plain step"
+					for (int v = 0; v < nr; v++) {
+						localRadii[v] = Math.exp(acc[v]);
+					}
+				}
+			}
 		}
 
 		// final consistent geometry, solved to full precision
@@ -455,7 +581,7 @@ public class CircuPacker {
 			int v = layoutVerts[i];
 			double zvx = localCentersX[v], zvy = localCentersY[v];
 			double rv = localRadii[v];
-			List<Integer> flower = tri.getFlower(v);
+			int[] flower = flowers[v];
 			double maxErr = 0.0;
 			for (int w : flower) {
 				double dx = zvx - localCentersX[w];
@@ -479,12 +605,12 @@ public class CircuPacker {
 		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
 			double r = localRadii[v];
-			List<Integer> flower = tri.getFlower(v);
+			int[] flower = flowers[v];
 			double diff = target;
-			int m = flower.size();
+			int m = flower.length;
 			for (int j = 0; j < m; j++) {
-				int w = flower.get(j);
-				int u = flower.get((j + 1) % m);
+				int w = flower[j];
+				int u = flower[(j + 1) % m];
 				double cosang = MathUtil.cosAngle(r, localRadii[w], localRadii[u]);
 				diff += Math.acos(Math.max(-1.0, Math.min(1.0, cosang)));
 			}
@@ -590,11 +716,7 @@ public class CircuPacker {
 		rimCount = rimVerts.length;
 
 		buildIndexing(); // rebuild v2indx/indx2v
-
-		// system dimension changed: the cached preconditioner no longer applies
-		cachedAMG = null;
-		amgAge = 0;
-		amgBaselineIters = -1;
+		buildSolverPattern(); // layout set changed: rebuild pattern, drop preconditioner
 	}
 
 	/** Final radii (valid after {@link #riffle(double)}). */
@@ -1325,6 +1447,12 @@ public class CircuPacker {
 		return Math.max(TOL_FLOOR, Math.min(TOL_CEIL, 0.01 * lastMaxVisErr));
 	}
 
+	private void copyLogRadii(double[] dst) {
+		for (int v = 0; v < dst.length; v++) {
+			dst[v] = Math.log(localRadii[v]);
+		}
+	}
+
 	/** Seed the solve with the previous pass's interior centers (warm start). */
 	private void seedWarmStart(double[] solx, double[] soly) {
 		for (int i = 0; i < layCount; i++) {
@@ -1335,96 +1463,9 @@ public class CircuPacker {
 	}
 
 	private void layoutCentersSolve(double tol) {
-		updateVdata();
+		assembleSystem();
 
-		int n = layCount;
-
-		// First pass: count nnz per row (we always add diagonal)
-		int[] rowCounts = new int[n];
-		Arrays.fill(rowCounts, 1); // diagonal per row
-		double[] bx = new double[n];
-		double[] by = new double[n];
-
-		for (int i = 0; i < n; i++) {
-			int v = layoutVerts[i];
-			double vrad = localRadii[v];
-			var fl = tri.getFlower(v);
-			int m = fl.size();
-			if (m == 0) {
-				continue;
-			}
-
-			double[] iR = inRadii[i];
-			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
-
-			double prevR = iR[m - 1];
-			for (int j = 0; j < m; j++) {
-				int w = fl.get(j);
-				double coeff = (prevR + iR[j]) * invTot / Math.max(1e-16, vrad + localRadii[w]);
-				prevR = iR[j];
-
-				int idxW = v2indx[w];
-				if (0 <= idxW && idxW < n) {
-					rowCounts[i]++; // internal neighbor contributes to A
-				} else {
-					// external neighbor contributes to RHS
-					bx[i] -= coeff * localCentersX[w];
-					by[i] -= coeff * localCentersY[w];
-				}
-			}
-		}
-
-		// Build CSR structure
-		int[] rowPtr = new int[n + 1];
-		rowPtr[0] = 0;
-		for (int i = 0; i < n; i++) {
-			rowPtr[i + 1] = rowPtr[i] + rowCounts[i];
-		}
-		int nnz = rowPtr[n];
-		int[] colIdx = new int[nnz];
-		double[] val = new double[nnz];
-		double[] Minv = new double[n];
-
-		// Second pass: fill values
-		int[] next = new int[n];
-		System.arraycopy(rowPtr, 0, next, 0, n);
-
-		for (int i = 0; i < n; i++) {
-			// Put diagonal first
-			int pos = next[i]++;
-			colIdx[pos] = i;
-			val[pos] = -1.0; // your system has diagonal -1
-			Minv[i] = -1.0 != 0.0 ? 1.0 / (-1.0) : 1.0; // Jacobi inverse
-
-			int v = layoutVerts[i];
-			double vrad = localRadii[v];
-			var fl = tri.getFlower(v);
-			int m = fl.size();
-			if (m == 0) {
-				continue;
-			}
-
-			double[] iR = inRadii[i];
-			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
-
-			double prevR = iR[m - 1];
-			for (int j = 0; j < m; j++) {
-				int w = fl.get(j);
-				double coeff = (prevR + iR[j]) * invTot / Math.max(1e-16, vrad + localRadii[w]);
-				prevR = iR[j];
-
-				int idxW = v2indx[w];
-				if (0 <= idxW && idxW < n) {
-					int p = next[i]++;
-					colIdx[p] = idxW;
-					val[p] = coeff;
-				} else {
-					// already accounted in bx/by in first pass
-				}
-			}
-		}
-
-		SparseCSR A = new SparseCSR(n, nnz, rowPtr, colIdx, val, Minv);
+		SparseCSR A = new SparseCSR(layCount, csrRowPtr[layCount], csrRowPtr, csrColIdx, csrVal, csrDiagInv);
 
 		// Reuse the AMG hierarchy across passes: matrix values drift slowly, so a
 		// slightly stale preconditioner still works; rebuild on age or when
@@ -1433,98 +1474,109 @@ public class CircuPacker {
 			rebuildAMG(A);
 		}
 
-		int maxIters = Math.max(1000, 10 * A.n);
+		int maxIters = Math.max(1000, 10 * layCount);
+		seedWarmStart(solX, solY);
 
-		double[] solx = new double[A.n];
-		double[] soly = new double[A.n];
-		seedWarmStart(solx, soly);
+		// writes to solX+solY
+		var r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, TOL_FLOOR, maxIters, cachedAMG);
 
-		// writes to solx+soly
-		BiCGStabSolver.Result rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, cachedAMG);
-		BiCGStabSolver.Result ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, cachedAMG);
-
-		if (!rx.converged || !ry.converged) {
+		if (!r.converged()) {
 			// A stale preconditioner may be at fault (or a breakdown polluted the
 			// iterate): rebuild from the current matrix and retry once from the
 			// warm start.
 			rebuildAMG(A);
-			seedWarmStart(solx, soly);
-			rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, cachedAMG);
-			ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, cachedAMG);
+			seedWarmStart(solX, solY);
+			r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, TOL_FLOOR, maxIters, cachedAMG);
+		}
+		if (!r.converged()) {
+			// last resort: BiCGStab tolerates numerical loss of definiteness
+			seedWarmStart(solX, solY);
+			BiCGStabSolver.solve(A, rhsX, solX, tol, maxIters, cachedAMG);
+			BiCGStabSolver.solve(A, rhsY, solY, tol, maxIters, cachedAMG);
 		}
 
-		int iters = Math.max(rx.iters, ry.iters);
 		if (amgBaselineIters < 0) {
-			amgBaselineIters = Math.max(1, iters);
-		} else if (iters > 2 * amgBaselineIters + 5) {
+			amgBaselineIters = Math.max(1, r.iters);
+		} else if (r.iters > 2 * amgBaselineIters + 5) {
 			amgAge = AMG_MAX_AGE; // convergence degrading: force rebuild next pass
 		}
 		amgAge++;
 
 		// Copy results back
-		for (int i = 0; i < n; i++) {
+		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
-			localCentersX[v] = solx[i];
-			localCentersY[v] = soly[i];
+			localCentersX[v] = solX[i];
+			localCentersY[v] = solY[i];
 		}
 	}
 
 	/**
 	 * <p>
-	 * Update per-layout-vertex incircle radii and total conductances.
+	 * Refreshes {@code csrVal}, {@code csrDiagInv} and the RHS from the current
+	 * {@code localRadii}/{@code localCenters}, writing into the fixed pattern
+	 * built by {@code buildSolverPattern()} (diagonal first per row, then
+	 * interior petals in flower order).
 	 * </p>
 	 *
 	 * <p>
-	 * What:
-	 * </p>
-	 * <ul>
-	 * <li>For each layout vertex v, compute an array
-	 * {@code inRadii[v][j] = sqrt((rv*ru*rw)/(rv+ru+rw))} for each face (triple)
-	 * adjacent to v.</li>
-	 * <li>Compute {@code conduct[v]} as the sum of edge conductances (t1+t2)/(rv +
-	 * r_w) over petals.</li>
-	 * </ul>
-	 *
-	 * <p>
-	 * Why:
-	 * </p>
-	 * <p>
-	 * These values are the geometric weights used when assembling {@code A} and the
-	 * RHS in {@code layoutCentersSolve()}. They reflect the edge-level tangency
-	 * geometry and ensure the resulting embedding respects local circle
-	 * configuration.
+	 * For each layout vertex v with petals w_j: the incircle radius of face j is
+	 * {@code t_j = sqrt(r_v*r_wj*r_wj+1 / (r_v+r_wj+r_wj+1))}, and the edge
+	 * weight to petal w_j is {@code W_vwj = (t_{j-1}+t_j)/(r_v+r_wj)} — symmetric
+	 * in v,w because the incircle sum belongs to the edge. Row v of the system is
+	 * {@code diag = sum_j W_vwj} (all petals), {@code offdiag = -W_vw} for
+	 * interior petals, and {@code rhs = sum W_vw * center(w)} over rim petals:
+	 * the SPD form of the GO transition system (each row is the original row
+	 * scaled by -conduct(v)).
 	 * </p>
 	 */
-	private void updateVdata() {
-		// Compute inRadii and node conduct for each interior (layout) vertex
-		inRadii = new double[layCount][];
-		conduct = new double[layCount];
-
+	private void assembleSystem() {
+		final double[] t = faceScratch;
 		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
-			double vr = localRadii[v];
-			List<Integer> fl = tri.getFlower(v);
-			int m = fl.size();
-			double[] data = new double[m];
-			for (int j = 0; j < m; j++) {
-				int wj = fl.get(j);
-				int wjp1 = fl.get((j + 1) % m);
-				double ur = localRadii[wjp1];
-				double wr = localRadii[wj];
-				// incircle radius: sqrt(vr*ur*wr / (vr+ur+wr))
-				data[j] = Math.sqrt(Math.max(0.0, vr * ur * wr / Math.max(1e-16, (vr + ur + wr))));
+			int rowStart = csrRowPtr[i];
+			double rv = localRadii[v];
+			int[] fl = flowers[v];
+			int m = fl.length;
+			if (m == 0) {
+				// isolated vertex: pin its center to the origin
+				csrVal[rowStart] = 1.0;
+				csrDiagInv[i] = 1.0;
+				rhsX[i] = 0.0;
+				rhsY[i] = 0.0;
+				continue;
 			}
-			inRadii[i] = data;
 
-			// total conductance
-			double sum = 0.0;
+			// incircle radii of the m faces around v (face j = petals j, j+1)
+			double rw = localRadii[fl[0]];
 			for (int j = 0; j < m; j++) {
-				int w = fl.get(j);
-				double t1 = data[(j - 1 + m) % m];
-				double t2 = data[j];
-				sum += (t1 + t2) / Math.max(1e-16, (vr + localRadii[w]));
+				double ru = localRadii[fl[(j + 1) % m]];
+				t[j] = Math.sqrt(Math.max(0.0, rv * ru * rw / Math.max(1e-16, rv + ru + rw)));
+				rw = ru;
 			}
-			conduct[i] = sum;
+
+			double diag = 0.0;
+			double bx = 0.0, by = 0.0;
+			int p = rowStart + 1; // slot 0 is the diagonal
+			double prevT = t[m - 1];
+			for (int j = 0; j < m; j++) {
+				int w = fl[j];
+				double coeff = (prevT + t[j]) / Math.max(1e-16, rv + localRadii[w]);
+				prevT = t[j];
+				diag += coeff;
+
+				int idxW = v2indx[w];
+				if (0 <= idxW && idxW < layCount) {
+					csrVal[p++] = -coeff; // interior neighbor
+				} else {
+					// rim (fixed-center) neighbor contributes to RHS
+					bx += coeff * localCentersX[w];
+					by += coeff * localCentersY[w];
+				}
+			}
+			csrVal[rowStart] = Math.max(1e-16, diag);
+			csrDiagInv[i] = 1.0 / csrVal[rowStart];
+			rhsX[i] = bx;
+			rhsY[i] = by;
 		}
 	}
 
@@ -1570,8 +1622,8 @@ public class CircuPacker {
 			int w = bdryListClosed[k];
 			double targetArea = vAims[w] / 2.0;
 
-			List<Integer> fl = tri.getFlower(w); // open flower
-			int m = fl.size();
+			int[] fl = flowers[w]; // open flower
+			int m = fl.length;
 			if (m < 2) {
 				continue;
 			}
@@ -1581,8 +1633,8 @@ public class CircuPacker {
 			double zx = localCentersX[w], zy = localCentersY[w];
 
 			for (int j = 0; j < m - 1; j++) {
-				int jr = fl.get(j);
-				int jl = fl.get(j + 1);
+				int jr = fl[j];
+				int jl = fl[j + 1];
 
 				double ang = MathUtil.angleAtCorner(zx, zy, localCentersX[jr], localCentersY[jr], localCentersX[jl], localCentersY[jl]);
 
@@ -1621,13 +1673,13 @@ public class CircuPacker {
 	}
 
 	private double sectorAreaAt(int v) {
-		List<Integer> fl = tri.getFlower(v);
-		int m = fl.size();
+		int[] fl = flowers[v];
+		int m = fl.length;
 		double zx = localCentersX[v], zy = localCentersY[v];
 		double area = 0.0;
 		for (int j = 0; j < m; j++) {
-			int jr = fl.get(j);
-			int jl = fl.get((j + 1) % m);
+			int jr = fl[j];
+			int jl = fl[(j + 1) % m];
 
 			double xjr = localCentersX[jr], yjr = localCentersY[jr];
 			double xjl = localCentersX[jl], yjl = localCentersY[jl];
