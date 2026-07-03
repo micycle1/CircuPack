@@ -84,7 +84,8 @@ public final class AMG implements Preconditioner {
 	 *                                  violated (e.g., minCoarseSize < 2 or
 	 *                                  maxLevels < 1).
 	 */
-	public AMG(int n, int[] rowPtr, int[] colIdx, double[] val, int minCoarseSize, int maxLevels, int preSmooth, int postSmooth, int topPostSmooth, double omega) {
+	public AMG(int n, int[] rowPtr, int[] colIdx, double[] val, int minCoarseSize, int maxLevels, int preSmooth, int postSmooth, int topPostSmooth,
+			double omega) {
 		this.minCoarseSize = Math.max(2, minCoarseSize);
 		this.maxLevels = Math.max(1, maxLevels);
 		this.preSmooth = Math.max(0, preSmooth);
@@ -121,14 +122,16 @@ public final class AMG implements Preconditioner {
 		prolongAdd(L, L.ec, x);
 
 		// Single post-smooth on the largest grid
-		if (topPostSmooth > 0)
+		if (topPostSmooth > 0) {
 			jacobiSmooth(L, b, x, topPostSmooth, omega);
+		}
 	}
 
 	// Inner levels
 	private void vcycle(Level L, double[] b, double[] x) {
-		if (preSmooth > 0)
+		if (preSmooth > 0) {
 			jacobiSmooth(L, b, x, preSmooth, omega);
+		}
 
 		// r = b - A x
 		residual(L, b, x, L.res);
@@ -142,14 +145,16 @@ public final class AMG implements Preconditioner {
 			Arrays.fill(L.ec, 0.0);
 			vcycle(L.coarse, L.rc, L.ec);
 			prolongAdd(L, L.ec, x);
-			if (postSmooth > 0)
+			if (postSmooth > 0) {
 				jacobiSmooth(L, b, x, postSmooth, omega);
+			}
 		}
 	}
 
 	private static void axpyInPlace(double[] y, double[] x, double alpha) {
-		for (int i = 0; i < y.length; i++)
+		for (int i = 0; i < y.length; i++) {
 			y[i] += alpha * x[i];
+		}
 	}
 
 	private void jacobiSmooth(Level L, double[] b, double[] x, int steps, double w) {
@@ -212,15 +217,18 @@ public final class AMG implements Preconditioner {
 
 		while (built < maxLevels && cur.n > minCoarseSize) {
 			Agg agg = pairwiseAggregate(cur.n, cur.rowPtr, cur.colIdx, cur.val);
-			if (agg.nc >= cur.n)
+			if (agg.nc >= cur.n) {
 				break;
+			}
 
 			// children lists for fast restrict/prolong
 			int[] childPtr = new int[agg.nc + 1];
-			for (int i = 0; i < cur.n; i++)
+			for (int i = 0; i < cur.n; i++) {
 				childPtr[agg.map[i] + 1]++;
-			for (int k = 0; k < agg.nc; k++)
+			}
+			for (int k = 0; k < agg.nc; k++) {
 				childPtr[k + 1] += childPtr[k];
+			}
 			int[] childIdx = new int[cur.n];
 			int[] next = childPtr.clone();
 			for (int i = 0; i < cur.n; i++) {
@@ -264,8 +272,9 @@ public final class AMG implements Preconditioner {
 					break;
 				}
 			}
-			if (!found || Math.abs(d) < diagEps)
+			if (!found || Math.abs(d) < diagEps) {
 				d = (d >= 0 ? diagEps : -diagEps);
+			}
 			L.Dinv[i] = 1.0 / d;
 		}
 		L.res = new double[n];
@@ -308,14 +317,16 @@ public final class AMG implements Preconditioner {
 		int nc = 0;
 
 		for (int i = 0; i < n; i++) {
-			if (agg[i] != -1)
+			if (agg[i] != -1) {
 				continue;
+			}
 			int bestJ = -1;
 			double bestW = -1.0;
 			for (int p = rp[i]; p < rp[i + 1]; p++) {
 				int j = ci[p];
-				if (j == i || agg[j] != -1)
+				if (j == i || agg[j] != -1) {
 					continue;
+				}
 				double w = Math.abs(a[p]);
 				if (w > bestW) {
 					bestW = w;
@@ -331,9 +342,11 @@ public final class AMG implements Preconditioner {
 			}
 		}
 
-		for (int i = 0; i < n; i++)
-			if (agg[i] == -1)
+		for (int i = 0; i < n; i++) {
+			if (agg[i] == -1) {
 				agg[i] = nc++;
+			}
+		}
 		return new Agg(agg, nc);
 	}
 
@@ -357,8 +370,9 @@ public final class AMG implements Preconditioner {
 		int[] map = agg.map;
 		@SuppressWarnings("unchecked")
 		HashMap<Integer, Double>[] rows = new HashMap[nc];
-		for (int k = 0; k < nc; k++)
+		for (int k = 0; k < nc; k++) {
 			rows[k] = new HashMap<>();
+		}
 
 		for (int i = 0; i < n; i++) {
 			int k = map[i];
@@ -412,8 +426,9 @@ public final class AMG implements Preconditioner {
 				}
 			}
 			int[] piv = new int[n];
-			for (int i = 0; i < n; i++)
+			for (int i = 0; i < n; i++) {
 				piv[i] = i;
+			}
 
 			for (int k = 0; k < n; k++) {
 				int pivRow = k;
@@ -443,8 +458,9 @@ public final class AMG implements Preconditioner {
 				for (int i = k + 1; i < n; i++) {
 					double lik = M[i * n + k] / pivot;
 					M[i * n + k] = lik;
-					for (int j = k + 1; j < n; j++)
+					for (int j = k + 1; j < n; j++) {
 						M[i * n + j] -= lik * M[k * n + j];
+					}
 				}
 			}
 			return new DenseLU(n, M, piv);
@@ -453,24 +469,28 @@ public final class AMG implements Preconditioner {
 		void solveInPlace(double[] x) {
 			// apply pivots
 			double[] rhs = x.clone();
-			for (int i = 0; i < n; i++)
+			for (int i = 0; i < n; i++) {
 				x[i] = rhs[piv[i]];
+			}
 
 			// forward
 			for (int i = 0; i < n; i++) {
 				double sum = x[i];
-				for (int j = 0; j < i; j++)
+				for (int j = 0; j < i; j++) {
 					sum -= lu[i * n + j] * x[j];
+				}
 				x[i] = sum;
 			}
 			// backward
 			for (int i = n - 1; i >= 0; i--) {
 				double sum = x[i];
-				for (int j = i + 1; j < n; j++)
+				for (int j = i + 1; j < n; j++) {
 					sum -= lu[i * n + j] * x[j];
+				}
 				double d = lu[i * n + i];
-				if (Math.abs(d) < 1e-14)
+				if (Math.abs(d) < 1e-14) {
 					d = (d >= 0 ? 1e-14 : -1e-14);
+				}
 				x[i] = sum / d;
 			}
 		}

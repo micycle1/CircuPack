@@ -10,13 +10,6 @@ import java.util.Objects;
 import java.util.Queue;
 import java.util.stream.Collectors;
 
-import org.ejml.data.DMatrixRMaj;
-import org.ejml.data.DMatrixSparseCSC;
-import org.ejml.data.DMatrixSparseTriplet;
-import org.ejml.ops.DConvertMatrixStruct;
-import org.ejml.sparse.FillReducing;
-import org.ejml.sparse.csc.factory.LinearSolverFactory_DSCC;
-
 import com.github.micycle1.circupack.linalg.AMG;
 import com.github.micycle1.circupack.linalg.BiCGStabSolver;
 import com.github.micycle1.circupack.linalg.Preconditioner;
@@ -26,82 +19,46 @@ import com.github.micycle1.circupack.triangulation.Triangulation;
 /**
  * <p>
  * Core repacking engine for circle packings — a Java port of Gerald Orick's
- * GOPacker MATLAB code. Manages combinatorics, geometric data, sparse matrix
- * assembly, and iterative repacking (riffle) to compute Euclidean circle
- * packings (default MAX_PACK) and polygonal/rectangular boundary layouts.
+ * GOPacker MATLAB code. Derives combinatorics (interior component, boundary
+ * loop, orphans) from a {@link Triangulation}, then iteratively alternates
+ * boundary placement, Tutte-style interior embedding (sparse linear solve) and
+ * effective-radii updates until the packing converges.
  * </p>
  *
  * <p>
- * What:
- * </p>
- * <ul>
- * <li>Holds derived combinatorics (interior component, boundary loop, orphans)
- * extracted from a provided {@code Triangulation} implementation.</li>
- * <li>Maintains working geometry: {@code localRadii}, {@code localCentersX/Y}
- * and final {@code radii}, {@code centersX/Y} arrays.</li>
- * <li>Provides the main iteration: boundary placement, Tutte-style interior
- * embedding (sparse linear system), and effective-radii updates.</li>
- * <li>Supports auxiliary tasks: prune orphans, polygonal rectangle support,
- * tangency computation, and spherical affine normalization.</li>
- * </ul>
- *
- * <p>
- * Why:
- * </p>
- * <p>
- * Encapsulates the repacking algorithms so callers only need to supply
- * combinatorics (via {@code Triangulation}) and optionally initial geometry.
- * The engine is written for correctness, debuggability and unit-testing: matrix
- * assembly and solves are explicit and instrumentable, and critical operations
- * (inRadii, conductance, RHS assembly) are isolated for verification.
- * </p>
- *
- * <p>
- * Key usage pattern:
+ * Usage:
  * </p>
  * <ol>
- * <li>Construct with a {@code Triangulation} instance (0-based indices).</li>
- * <li>Call {@code initialize()} to derive internal state and defaults.</li>
- * <li>Optionally call {@code setMode(...)} for polygonal modes or set
- * corners/sides.</li>
- * <li>Run {@code riffle(passCount)} to iterate layout and radius updates.</li>
- * <li>Retrieve results or {@code writeBackToTriangulation()} to store
- * centers/radii.</li>
+ * <li>Construct with a {@code Triangulation} (0-based indices; see its javadoc
+ * for the flower/boundary conventions).</li>
+ * <li>Optionally configure the target shape: {@link #setPolygonPack(int[])},
+ * {@link #setRectanglePack()}, etc. The default is {@link Mode#MAX_PACK}
+ * (packing the unit disc).</li>
+ * <li>Run {@link #riffle(double)} to iterate until the maximum relative visual
+ * error falls below the given threshold.</li>
+ * <li>Retrieve results via {@link #getRadii()}, {@link #getCentersX()},
+ * {@link #getCentersY()}.</li>
  * </ol>
  *
  * <p>
- * Important assumptions & notes:
+ * The class is not thread-safe; callers should synchronize externally if
+ * needed.
  * </p>
- * <ul>
- * <li>Triangulation contract: {@code getFlower(v)} returns CCW neighbor lists;
- * interior flowers are cyclic (no repeated first element), boundary flowers are
- * open (first != last). {@code getBoundaryLoop()} must be CCW and list each
- * boundary vertex exactly once (no repeated close).</li>
- * <li>Vertex indices are 0-based.</li>
- * <li>Radii should be positive; small or zero radii can cause numerical
- * issues.</li>
- * <li>The class is not thread-safe; callers should synchronize externally if
- * needed.</li>
- * </ul>
- *
- * <p>
- * Numerical/stability hints:
- * </p>
- * <ul>
- * <li>For classic MAX_PACK behavior, freeze boundary radii (engine supports
- * this) to maximize stability on small complexes.</li>
- * <li>GO-style boundary updates can be enabled but are damped/clamped in the
- * implementation to avoid runaway oscillation.</li>
- * <li>Monitoring values such as {@code maxVis} (dimensionless relative visual
- * error) and debug routines (row dumps, boundary stats) are provided for
- * diagnosis.</li>
- * </ul>
  */
 public class CircuPacker {
-	
-	private static final int MAX_ITER = 50;
 
-	// External triangulation (combinatorics and optional geometry)
+	/**
+	 * Packing modes, mirroring GOPack: MAX_PACK packs the unit disc (boundary
+	 * circles become horocycles); POLYGONAL packs so the boundary forms an n-gon
+	 * with prescribed corner angles (side lengths emerge from the packing).
+	 */
+	public enum Mode {
+		MAX_PACK, POLYGONAL
+	}
+
+	private static final int MAX_ITER = 200;
+
+	// External triangulation (combinatorics)
 	private final Triangulation tri;
 
 	// Geometry flag: -1 hyp, 0 eucl, +1 sph; we operate in Euclidean throughout
@@ -129,14 +86,13 @@ public class CircuPacker {
 	private int orphanCount = 0;
 
 	// mapping convenience
-	private boolean[] isInterior; // interior vs boundary (simple classification)
 	private boolean[] isBoundary; // boundary marking
 	private boolean hasBoundary; // whether triangulation has a boundary
 
 	// Radii and centers (Euclidean), both working (local) and final (best-known)
-	public double[] radii; // final radii (after riffle)
-	public double[] centersX; // final centers
-	public double[] centersY;
+	private double[] radii; // final radii (after riffle)
+	private double[] centersX; // final centers
+	private double[] centersY;
 
 	private double[] localRadii; // working radii during iteration
 	private double[] localCentersX; // working centers
@@ -167,7 +123,7 @@ public class CircuPacker {
 	// We'll build A and b on each layout step from current localRadii/localCenters.
 	// We don't store explicit "transition/rhs" topologies separately,
 	// since we can compute them deterministically from neighbors lists each time.
-	private Triangulation.Mode mode = Triangulation.Mode.MAX_PACK;
+	private Mode mode = Mode.MAX_PACK;
 
 	// For polygonal mode
 	private int[] corners = null; // CCW corners
@@ -176,127 +132,49 @@ public class CircuPacker {
 	// Monitoring
 	private final List<Double> visErrMonitor = new ArrayList<>();
 
-	// Constructor
+	/**
+	 * Builds the engine from the given triangulation: classifies
+	 * interior/boundary/orphan vertices, seeds working geometry, and defaults to
+	 * {@link Mode#MAX_PACK} aims. Configure a polygonal target afterwards via
+	 * {@link #setPolygonPack(int[])} or {@link #setRectanglePack()} if desired,
+	 * then call {@link #riffle(double)}.
+	 */
 	public CircuPacker(Triangulation tri) {
 		this.tri = Objects.requireNonNull(tri, "tri must not be null");
-	}
 
-	// Initialize combinatorics, defaults, radii/centers, aims, mode
-	/**
-	 * <p>
-	 * Initialize internal engine state from the provided {@code Triangulation}.
-	 * </p>
-	 *
-	 * <p>
-	 * What:
-	 * </p>
-	 * <ul>
-	 * <li>Reads vertex count, boundary loop, flowers, optional
-	 * centers/radii/aims.</li>
-	 * <li>Classifies interior/boundary/orphan vertices and builds default
-	 * layout/rim sets.</li>
-	 * <li>Initializes working arrays: {@code localRadii}, {@code localCentersX/Y},
-	 * {@code vAims}, and polygon metadata if present.</li>
-	 * </ul>
-	 *
-	 * <p>
-	 * Why:
-	 * </p>
-	 * <p>
-	 * Prepare all derived combinatorial and geometric arrays so subsequent packing
-	 * operations (layout, update, riffle) can assume a consistent internal
-	 * representation.
-	 * </p>
-	 */
-	public void initialize() {
 		n = tri.getVertexCount();
 		if (n <= 0) {
 			throw new IllegalStateException("Triangulation has no vertices");
 		}
 
-		// read mode hint
-		mode = tri.getMode() != null ? tri.getMode() : Triangulation.Mode.MAX_PACK;
-
-		// set alpha, gamma if provided
-		alpha = tri.getAlpha();
-		gamma = tri.getGamma();
-
 		// boundary presence
 		List<Integer> bdryLoop = tri.getBoundaryLoop();
 		hasBoundary = bdryLoop != null && !bdryLoop.isEmpty();
 
-		// classify interior/boundary naive
 		isBoundary = new boolean[n];
 		for (int v = 0; v < n; v++) {
 			isBoundary[v] = tri.isBoundaryVertex(v);
 		}
-		isInterior = new boolean[n];
-		for (int v = 0; v < n; v++) {
-			isInterior[v] = !isBoundary[v];
-		}
 
-		// Find interior connected component containing alpha; if alpha invalid, pick a
-		// default interior
-		if (alpha < 0 || alpha >= n || isBoundary[alpha]) {
-			alpha = pickAnInteriorVertexOrFallback();
-		}
+		alpha = pickAnInteriorVertexOrFallback();
 
 		// Derive intVerts, bdryListClosed, and orphanVerts, similar to complex_count.m
 		// logic
 		deriveInteriorBoundaryOrphans();
 
-		// Copy provided geometry if available; else default
-		if (tri.getRadii() != null) {
-			radii = tri.getRadii().clone();
-		} else {
-			radii = new double[n];
-			Arrays.fill(radii, 0.5);
-		}
-		if (tri.hasCenters()) {
-			double[] cx = tri.getCentersX();
-			double[] cy = tri.getCentersY();
-			centersX = cx != null ? cx.clone() : new double[n];
-			centersY = cy != null ? cy.clone() : new double[n];
-		} else {
-			centersX = new double[n];
-			centersY = new double[n];
-		}
+		// Seed geometry: uniform radii, centers at origin (both are recomputed by
+		// riffle; radii serve as the initial guess)
+		radii = new double[n];
+		Arrays.fill(radii, 0.5);
+		centersX = new double[n];
+		centersY = new double[n];
 
 		localRadii = radii.clone();
 		localCentersX = centersX.clone();
 		localCentersY = centersY.clone();
 
-		// aims
-		if (tri.hasVAims()) {
-			double[] a = tri.getVAims();
-			if (a != null && a.length == n) {
-				vAims = a.clone();
-			}
-		}
-		if (vAims == null) {
-			vAims = new double[n];
-			Arrays.fill(vAims, 2.0 * Math.PI);
-			for (int v = 0; v < n; v++) {
-				if (isBoundary[v]) {
-					vAims[v] = -1.0;
-				}
-			}
-		}
-
-		// polygonal metadata if present
-		if (mode == Triangulation.Mode.POLYGONAL || mode == Triangulation.Mode.FIXED_CORNERS) {
-			List<Integer> cn = tri.getCorners();
-			if (cn != null && !cn.isEmpty()) {
-				corners = cn.stream().mapToInt(Integer::intValue).toArray();
-			}
-			List<List<Integer>> sd = tri.getSides();
-			if (sd != null && !sd.isEmpty()) {
-				sides = new ArrayList<>();
-				for (List<Integer> s : sd) {
-					sides.add(s.stream().mapToInt(Integer::intValue).toArray());
-				}
-			}
-		}
+		vAims = new double[n];
+		setMaxPack();
 
 		// Default layoutVerts = intVerts; rimVerts = boundary loop (closed)
 		layoutVerts = intVerts.clone();
@@ -309,119 +187,189 @@ public class CircuPacker {
 		buildIndexing();
 	}
 
-	// Public API methods
-
-	public void setMode(Triangulation.Mode desiredMode, int[] cornersIn, List<int[]> sidesIn, double[] cornerAngles) {
-		if (desiredMode == null) {
-			desiredMode = Triangulation.Mode.MAX_PACK;
-		}
-
-		if (hes > 0 && desiredMode != Triangulation.Mode.MAX_PACK) {
-			// Sphere must be in MAX_PACK
-			this.mode = Triangulation.Mode.MAX_PACK;
-		} else {
-			this.mode = desiredMode;
-		}
-
-		if (this.mode == Triangulation.Mode.MAX_PACK) {
-			// aims: interior 2*pi; boundary -1
-			Arrays.fill(vAims, 2.0 * Math.PI);
-			for (int v = 0; v < n; v++) {
-				if (isBoundary[v]) {
-					vAims[v] = -1.0;
-				}
-			}
-			return;
-		}
-
-		// POLYGONAL / FIXED_CORNERS
-		// Corners/sides optional. If cornersIn provided, validate boundary membership.
-		if (cornersIn != null && cornersIn.length >= 3) {
-			for (int c : cornersIn) {
-				if (!isBoundary[c]) {
-					throw new IllegalArgumentException("Corner " + c + " is not a boundary vertex");
-				}
-			}
-			this.corners = cornersIn.clone();
-		} else if (this.corners == null || this.corners.length < 3) {
-			this.corners = chooseRandomCorners(4); // fallback 4-gon
-		}
-
-		if (sidesIn != null && !sidesIn.isEmpty()) {
-			this.sides = new ArrayList<>(sidesIn);
-		} else {
-			// derive sides by splitting boundary loop at corners
-			this.sides = derivePolygonSidesFromCorners(this.corners);
-		}
-
-		// set default aims: boundary pi except corners get equal angles by default
-		for (int w : rimVerts) {
-			vAims[w] = Math.PI;
-		}
-		if (cornerAngles != null) {
-			if (cornerAngles.length != this.corners.length) {
-				throw new IllegalArgumentException("Corner angles length mismatch");
-			}
-			for (int i = 0; i < this.corners.length; i++) {
-				vAims[this.corners[i]] = cornerAngles[i];
-			}
-		} else {
-			int m = this.corners.length;
-			for (int i = 0; i < m; i++) {
-				vAims[this.corners[i]] = Math.PI * (1.0 - 2.0 / m);
+	/**
+	 * Configure classic max packing (the default): interior angle sums aim at
+	 * 2&pi;, boundary radii adjust GO-style so the boundary hugs the unit circle.
+	 */
+	public void setMaxPack() {
+		mode = Mode.MAX_PACK;
+		corners = null;
+		sides = null;
+		Arrays.fill(vAims, 2.0 * Math.PI);
+		for (int v = 0; v < n; v++) {
+			if (isBoundary[v]) {
+				vAims[v] = -1.0;
 			}
 		}
-	}
-
-	public void debugDumpSystemRow0() {
-		if (layCount == 0) {
-			return;
-		}
-		int v = layoutVerts[0];
-		double vrad = localRadii[v];
-		var fl = tri.getFlower(v);
-		int m = fl.size();
-		double[] data = inRadii[0];
-		double total = Math.max(1e-16, conduct[0]);
-
-		double sumCoeff = 0;
-		double sumBx = 0, sumBy = 0;
-		for (int j = 0; j < m; j++) {
-			int w = fl.get(j);
-			double t1 = data[(j - 1 + m) % m];
-			double t2 = data[j];
-			double coeff = ((t1 + t2) / Math.max(1e-16, (vrad + localRadii[w]))) / total;
-			int idxW = v2indx[w];
-			String kind = (0 <= idxW && idxW < layCount) ? "int" : "rim";
-			System.out.printf("j=%d w=%d coeff=%.8f kind=%s  zw=(%.6f,%.6f)\n", j, w, coeff, kind, localCentersX[w], localCentersY[w]);
-			sumCoeff += coeff;
-			if (!"int".equals(kind)) {
-				sumBx += coeff * localCentersX[w];
-				sumBy += coeff * localCentersY[w];
-			}
-		}
-		System.out.printf("diag=-1.0, sumCoeff(all nbrs)=%.8f\n", sumCoeff);
-		System.out.printf("Expected interior center from rims only: (%.8f, %.8f)\n", sumBx, sumBy);
 	}
 
 	/**
-	 * 
+	 * Configure polygonal packing with {@code numSides} corners chosen evenly
+	 * spaced along the boundary loop, all corner angles equal.
+	 */
+	public void setPolygonPack(int numSides) {
+		setPolygonPack(chooseSpacedCorners(numSides), null);
+	}
+
+	/**
+	 * Configure polygonal packing with the given corner vertices (boundary
+	 * vertices, in any order — they are sorted CCW along the boundary anchored at
+	 * the first). Corner angles default to those of a regular n-gon,
+	 * &pi;(1&minus;2/n).
+	 */
+	public void setPolygonPack(int[] cornersIn) {
+		setPolygonPack(cornersIn, null);
+	}
+
+	/**
+	 * Configure polygonal packing: the boundary is packed into an n-gon whose
+	 * corners are the given boundary vertices with the given interior angles (side
+	 * lengths emerge from the packing).
+	 *
+	 * @param cornersIn    at least 3 distinct boundary vertices; sorted CCW along
+	 *                     the boundary anchored at the first supplied corner
+	 * @param cornerAngles interior angle per corner in (0, &pi;), summing to
+	 *                     (n&minus;2)&pi;; null for equal angles
+	 */
+	public void setPolygonPack(int[] cornersIn, double[] cornerAngles) {
+		if (hes > 0 || !hasBoundary || bdryCount < 3) {
+			throw new IllegalStateException("Polygon mode requires a boundary with at least 3 vertices.");
+		}
+		if (cornersIn == null || cornersIn.length < 3) {
+			throw new IllegalArgumentException("Polygon mode requires at least 3 corners");
+		}
+
+		// Validate boundary membership + uniqueness
+		boolean[] seen = new boolean[n];
+		for (int c : cornersIn) {
+			if (c < 0 || c >= n || !isBoundary[c]) {
+				throw new IllegalArgumentException("Corner " + c + " is not a boundary vertex");
+			}
+			if (seen[c]) {
+				throw new IllegalArgumentException("Duplicate corner vertex: " + c);
+			}
+			seen[c] = true;
+		}
+
+		// Validate corner angles if given: turning angles (pi - angle) sum to 2*pi
+		if (cornerAngles != null) {
+			if (cornerAngles.length != cornersIn.length) {
+				throw new IllegalArgumentException("Corner angles length mismatch");
+			}
+			double sum = 0.0;
+			for (double a : cornerAngles) {
+				if (!(a > 0.0 && a < Math.PI)) {
+					throw new IllegalArgumentException("Each corner angle must be in (0, pi): " + a);
+				}
+				sum += a;
+			}
+			double expected = cornersIn.length * Math.PI - 2.0 * Math.PI;
+			if (Math.abs(sum - expected) > 1e-2) {
+				throw new IllegalArgumentException("Corner angles inconsistent with polygon turning angles; expected sum " + expected + " but got " + sum);
+			}
+		}
+
+		// Reorder corners into CCW boundary order, preserving the first supplied
+		// corner as anchor
+		OrderedCorners ordered = orderCornersCCW(cornersIn.clone(), cornerAngles);
+		this.corners = ordered.corners;
+		this.sides = derivePolygonSidesFromCorners(this.corners);
+		this.mode = Mode.POLYGONAL;
+
+		// Aims: interior 2*pi; boundary pi; corners get their angles
+		Arrays.fill(vAims, 2.0 * Math.PI);
+		for (int w : rimVerts) {
+			vAims[w] = Math.PI;
+		}
+		if (ordered.angles != null) {
+			for (int i = 0; i < this.corners.length; i++) {
+				vAims[this.corners[i]] = ordered.angles[i];
+			}
+		} else {
+			int m = this.corners.length;
+			double equalCorner = Math.PI * (1.0 - 2.0 / m);
+			for (int c : this.corners) {
+				vAims[c] = equalCorner;
+			}
+		}
+	}
+
+	/**
+	 * Configure rectangular packing with 4 corners chosen evenly spaced along the
+	 * boundary loop. See {@link #setRectanglePack(int[])}.
+	 */
+	public void setRectanglePack() {
+		setRectanglePack(chooseSpacedCorners(4));
+	}
+
+	/**
+	 * Configure rectangular packing: polygonal packing with 4 corners and all
+	 * corner angles &pi;/2. The aspect ratio of the resulting rectangle emerges
+	 * from the packing; query it with {@link #getAspect()}.
+	 */
+	public void setRectanglePack(int[] fourCorners) {
+		if (fourCorners == null || fourCorners.length != 4) {
+			throw new IllegalArgumentException("Rectangle packing requires exactly 4 corners");
+		}
+		double[] rightAngles = new double[4];
+		Arrays.fill(rightAngles, Math.PI / 2.0);
+		setPolygonPack(fourCorners, rightAngles);
+	}
+
+	/** The current packing mode. */
+	public Mode getMode() {
+		return mode;
+	}
+
+	/**
+	 * The CCW-ordered corner vertices in use for polygonal packing, or null in
+	 * MAX_PACK mode. Useful when corners were auto-chosen.
+	 */
+	public int[] getCorners() {
+		return corners == null ? null : corners.clone();
+	}
+
+	/**
+	 * Aspect ratio (top+bottom)/(left+right) of a rectangular packing, computed
+	 * from the current centers. Requires POLYGONAL mode with exactly 4 corners;
+	 * call after {@link #riffle(double)}.
+	 */
+	public double getAspect() {
+		if (mode != Mode.POLYGONAL || corners == null || corners.length != 4) {
+			throw new IllegalStateException("Aspect requires polygonal mode with 4 corners");
+		}
+		double top = hyp(corners[1], corners[0]);
+		double rend = hyp(corners[3], corners[0]);
+		double lend = hyp(corners[2], corners[1]);
+		double bot = hyp(corners[3], corners[2]);
+		return (top + bot) / (rend + lend);
+	}
+
+	/**
+	 * Iterate boundary layout, interior embedding, and effective-radii updates
+	 * until the maximum relative visual error falls below the threshold (or an
+	 * iteration cap is hit). Returns the number of passes run.
+	 *
 	 * @param maxRelativeError in practice a lot visually lower!
-	 * @return
 	 */
 	public int riffle(double maxRelativeError) {
-		// TODO max raw/pixel error
-		maxRelativeError = Math.max(1e-4, maxRelativeError); // floor at 1e-4 (0.1%)
+		maxRelativeError = Math.max(1e-4, maxRelativeError);
 		int pass = 0;
 		double maxVis = Double.MAX_VALUE;
 
 		while (maxVis > maxRelativeError && pass < MAX_ITER) {
-			layoutBoundary(); // set boundary centers (and possibly scale radii)
-			layoutCentersSolveFast(); // solve A * Z = rhs for interior centers
-			setEffectiveRadii(); // update effective radii
+			layoutBoundary();
+			layoutCentersSolve();
+			setEffectiveRadii();
+
 			maxVis = updateVisErrorMonitor();
 			pass++;
 		}
+
+		// final consistent geometry
+		layoutBoundary();
+		layoutCentersSolve();
+
 		radii = localRadii.clone();
 		centersX = localCentersX.clone();
 		centersY = localCentersY.clone();
@@ -626,15 +574,24 @@ public class CircuPacker {
 		buildIndexing(); // rebuild v2indx/indx2v
 	}
 
-	// Export back to Triangulation (optional)
-	public void writeBackToTriangulation() {
-		tri.setRadii(radii.clone());
-		tri.setCenters(centersX.clone(), centersY.clone());
-		tri.setVAims(vAims.clone());
-		tri.setAlpha(alpha);
-		if (gamma >= 0) {
-			tri.setGamma(gamma);
-		}
+	/** Final radii (valid after {@link #riffle(double)}). */
+	public double[] getRadii() {
+		return radii;
+	}
+
+	/** Final center x-coordinates (valid after {@link #riffle(double)}). */
+	public double[] getCentersX() {
+		return centersX;
+	}
+
+	/** Final center y-coordinates (valid after {@link #riffle(double)}). */
+	public double[] getCentersY() {
+		return centersY;
+	}
+
+	/** Max relative visual error recorded after each riffle pass. */
+	public List<Double> getVisErrMonitor() {
+		return Collections.unmodifiableList(visErrMonitor);
 	}
 
 	// Getters for testing
@@ -666,26 +623,24 @@ public class CircuPacker {
 		return bdryListClosed;
 	}
 
-	// --------------- Internals ---------------
-
-	private int[] chooseRandomCorners(int sideN) {
+	private int[] chooseSpacedCorners(int sideN) {
 		if (bdryCount < 3) {
 			throw new IllegalStateException("Boundary must have at least 3 vertices");
 		}
-		if (sideN < 3) {
-			sideN = 3;
-		}
-		if (sideN > bdryCount) {
-			sideN = bdryCount;
-		}
+		sideN = Math.max(3, Math.min(sideN, bdryCount));
 
 		int[] crn = new int[sideN];
 		int step = Math.max(1, bdryCount / sideN);
-		int start = 0; // deterministic start at gamma could be used instead
-		// If you prefer to start at gamma:
-		// int start = 0;
-		// for (int i = 0; i < bdryCount; i++) if (bdryListClosed[i] == gamma) { start =
-		// i; break; }
+
+		int start = 0;
+		if (gamma >= 0) {
+			for (int i = 0; i < bdryCount; i++) {
+				if (bdryListClosed[i] == gamma) {
+					start = i;
+					break;
+				}
+			}
+		}
 
 		for (int e = 0; e < sideN; e++) {
 			crn[e] = bdryListClosed[(start + e * step) % bdryCount];
@@ -903,7 +858,7 @@ public class CircuPacker {
 	 * </p>
 	 */
 	private void layoutBoundary() {
-		if (mode == Triangulation.Mode.POLYGONAL || mode == Triangulation.Mode.FIXED_CORNERS) {
+		if (mode == Mode.POLYGONAL) {
 			setPolygonCenters();
 		} else {
 			setHoroCenters();
@@ -1063,8 +1018,12 @@ public class CircuPacker {
 	 * </p>
 	 */
 	private void setPolygonCenters() {
+		if (corners == null || sides == null) {
+			throw new IllegalStateException("Polygonal mode without corners; configure via setPolygonPack/setRectanglePack");
+		}
+
 		// if rectangle (4 corners) with all right angles, do rectangular layout
-		if (corners != null && corners.length == 4) {
+		if (corners.length == 4) {
 			double bendErr = 0.0;
 			for (int c : corners) {
 				bendErr += Math.abs(vAims[c] - Math.PI / 2.0);
@@ -1099,7 +1058,7 @@ public class CircuPacker {
 			double opp1 = vAims[corners[2]];
 			double opp2 = vAims[corners[0]];
 			if (opp1 <= 0 || opp2 <= 0 || (opp1 + opp2) >= Math.PI) {
-				return;
+				throw new IllegalStateException("Invalid triangle corner aims: " + opp2 + ", " + vAims[corners[1]] + ", " + opp1);
 			}
 			double opp3 = Math.PI - (opp1 + opp2);
 			targetLength[0] = 1.0;
@@ -1272,8 +1231,10 @@ public class CircuPacker {
 			localCentersX[side[0]] = spotX;
 			localCentersY[side[0]] = spotY;
 
+			// place only the side's internal vertices: each corner stays exactly at
+			// its rectangle corner (set when its own side starts)
 			double prev = localRadii[start];
-			for (int i = 0; i < side.length - 1; i++) {
+			for (int i = 0; i < side.length - 2; i++) {
 				int nxt = side[i + 1];
 				double next = localRadii[nxt];
 				spotX += sf * dirx[k] * (prev + next);
@@ -1291,39 +1252,42 @@ public class CircuPacker {
 		}
 	}
 
-	private List<int[]> derivePolygonSidesFromCorners(int[] crn) {
-		// Split bdry loop at corners; ensure CCW order starting at gamma if set.
-		List<Integer> loop = Arrays.stream(bdryListClosed, 0, bdryCount).boxed().collect(Collectors.toList());
-		// reorder corners in CCW boundary order
-		List<Integer> cornerList = Arrays.stream(crn).boxed().collect(Collectors.toList());
-		cornerList.sort(Comparator.comparingInt(loop::indexOf));
-		int m = cornerList.size();
+	private List<int[]> derivePolygonSidesFromCorners(int[] orderedCorners) {
+		if (orderedCorners == null || orderedCorners.length < 3) {
+			throw new IllegalArgumentException("Need at least 3 corners");
+		}
 
-		List<int[]> result = new ArrayList<>();
-		for (int i = 0; i < m; i++) {
-			int a = cornerList.get(i);
-			int b = cornerList.get((i + 1) % m);
-			int ia = loop.indexOf(a);
-//			int ib = loop.indexOf(b);
+		List<Integer> loop = Arrays.stream(bdryListClosed, 0, bdryCount).boxed().collect(Collectors.toList());
+		List<int[]> result = new ArrayList<>(orderedCorners.length);
+
+		for (int i = 0; i < orderedCorners.length; i++) {
+			int a = orderedCorners[i];
+			int b = orderedCorners[(i + 1) % orderedCorners.length];
+
+			int ia = boundaryPosition(a);
+			if (ia < 0) {
+				throw new IllegalStateException("Corner " + a + " not found in boundary loop");
+			}
+
 			List<Integer> side = new ArrayList<>();
-			side.add(a);
 			int k = ia;
-			while (true) {
+			side.add(loop.get(k));
+
+			while (loop.get(k) != b) {
 				k = (k + 1) % bdryCount;
 				side.add(loop.get(k));
-				if (loop.get(k) == b) {
-					break;
-				}
-				if (side.size() > bdryCount + 5) {
+				if (side.size() > bdryCount + 1) {
 					throw new IllegalStateException("Side extraction overflow");
 				}
 			}
+
 			result.add(side.stream().mapToInt(Integer::intValue).toArray());
 		}
+
 		return result;
 	}
 
-	private void layoutCentersSolveFast() {
+	private void layoutCentersSolve() {
 		updateVdata();
 
 		int n = layCount;
@@ -1427,91 +1391,15 @@ public class CircuPacker {
 		double[] solx = new double[A.n];
 		double[] soly = new double[A.n];
 
-		BiCGStabSolver.Result rx = BiCGStabSolver.solve(A, bx, solx, tol, maxIters, precond);
-		BiCGStabSolver.Result ry = BiCGStabSolver.solve(A, by, soly, tol, maxIters, precond);
+		// writes to solx+soly
+		BiCGStabSolver.solve(A, bx, solx, tol, maxIters, precond);
+		BiCGStabSolver.solve(A, by, soly, tol, maxIters, precond);
 
 		// Copy results back
 		for (int i = 0; i < n; i++) {
 			int v = layoutVerts[i];
 			localCentersX[v] = solx[i];
 			localCentersY[v] = soly[i];
-		}
-	}
-
-	// Compute interior centers by solving a Tutte-style sparse linear system.
-	@Deprecated // original, slower solution
-	private void layoutCentersSolve() {
-		updateVdata();
-
-		int estNnz = 0;
-		for (int k = 0; k < layCount; k++) {
-			estNnz += tri.getFlower(layoutVerts[k]).size() + 1;
-		}
-
-		DMatrixSparseTriplet Atr = new DMatrixSparseTriplet(layCount, layCount, estNnz);
-		double[] bx = new double[layCount];
-		double[] by = new double[layCount];
-
-		// assemble A , bx , by
-		for (int i = 0; i < layCount; i++) {
-
-			int v = layoutVerts[i];
-			double vrad = localRadii[v];
-			var fl = tri.getFlower(v); // neighbour list
-			int m = fl.size();
-			double[] iR = inRadii[i];
-			double invTot = 1.0 / Math.max(1e-16, conduct[i]);
-
-			// iagonal entry (always –1)
-			Atr.addItem(i, i, -1.0);
-
-			// nothing to do if the flower is empty
-			if (m == 0) {
-				continue;
-			}
-
-			/* iterate flower, using prevR to avoid (j-1+m)%m */
-			double prevR = iR[m - 1];
-			for (int j = 0; j < m; j++) {
-
-				int w = fl.get(j);
-				double coeff = (prevR + iR[j]) * invTot / Math.max(1e-16, vrad + localRadii[w]);
-				prevR = iR[j];
-
-				int idxW = v2indx[w];
-				if (0 <= idxW && idxW < layCount) { // internal neighbour
-					Atr.addItem(i, idxW, coeff);
-				} else { // already solved
-					bx[i] -= coeff * localCentersX[w];
-					by[i] -= coeff * localCentersY[w];
-				}
-			}
-		}
-
-		// 2) convert to CSC only once and solve both RHS at once
-		DMatrixSparseCSC A = DConvertMatrixStruct.convert(Atr, (DMatrixSparseCSC) null);
-
-		// build RHS in correct row-major order
-		DMatrixRMaj RHS = new DMatrixRMaj(layCount, 2);
-		for (int r = 0, p = 0; r < layCount; r++, p += 2) {
-			RHS.data[p] = bx[r]; // column 0 (x)
-			RHS.data[p + 1] = by[r]; // column 1 (y)
-		}
-
-		// one LU factorisation – two solves
-		var solver = LinearSolverFactory_DSCC.lu(FillReducing.IDENTITY); // ideally AMD
-		if (!solver.setA(A)) {
-			throw new RuntimeException("Linear solver failed to set A (possibly singular)");
-		}
-
-		DMatrixRMaj sol = new DMatrixRMaj(layCount, 2);
-		solver.solve(RHS, sol);
-
-		// 3) copy results back
-		for (int i = 0; i < layCount; i++) {
-			int v = layoutVerts[i];
-			localCentersX[v] = sol.get(i, 0);
-			localCentersY[v] = sol.get(i, 1);
 		}
 	}
 
@@ -1576,69 +1464,86 @@ public class CircuPacker {
 
 	/**
 	 * <p>
-	 * Set {@code localRadii} to effective radii derived from current centers.
+	 * Set {@code localRadii} to effective radii derived from current centers (port
+	 * of {@code setEffective.m}).
 	 * </p>
 	 *
-	 * <p>
-	 * What:
-	 * </p>
 	 * <ul>
-	 * <li>For interior layout vertices: compute sector areas from neighboring
-	 * centers and set r_eff = sqrt(area / (vAims(v)/2)) when the target aim
-	 * indicates adjustment.</li>
-	 * <li>For boundary vertices: compute wedge areas and angle sums over the open
-	 * boundary flower and update radii only when aims indicate (GO-style) boundary
-	 * adjustment; otherwise optionally skip (classical MAX_PACK keeps boundary
-	 * radii frozen).</li>
-	 * <li>Includes damping/clamping safeguards to avoid large per-iteration jumps
-	 * that destabilize packing.</li>
+	 * <li>Positive aim (interiors; boundary vertices in polygonal mode): compute
+	 * sector areas from neighboring centers and set r_eff = sqrt(area /
+	 * (vAims(v)/2)).</li>
+	 * <li>Negative aim (boundary in max packing): GO-style update r_eff =
+	 * sqrt(2*area/angsum), averaged with the old radius to moderate
+	 * oscillation.</li>
+	 * <li>Aims near zero (e.g. the 3-boundary-vertex disc case): radius left
+	 * unchanged.</li>
 	 * </ul>
-	 *
-	 * <p>
-	 * Why:
-	 * </p>
-	 * <p>
-	 * Effective radii allow radii to adapt to geometric layout so that target
-	 * angle-sums (or target areas) are better satisfied. Moderation (damping/clamp)
-	 * keeps iteration stable on small or noisy meshes.
-	 * </p>
 	 */
 	private void setEffectiveRadii() {
-		// interior adjustments: sector-area sum vs target area (aim/2)
+		// ---------------- interior ----------------
 		for (int i = 0; i < layCount; i++) {
 			int v = layoutVerts[i];
 			double targetArea = vAims[v] / 2.0;
 			if (targetArea <= 1e-3) {
 				continue;
 			}
+
 			double area = sectorAreaAt(v);
-			localRadii[v] = Math.sqrt(Math.max(0.0, area / targetArea));
+			if (!(area > 0.0) || !Double.isFinite(area)) {
+				continue;
+			}
+
+			double newr = Math.sqrt(area / targetArea);
+			if (newr > 0.0 && Double.isFinite(newr)) {
+				localRadii[v] = newr;
+			}
 		}
-		// boundary adjustments (bdry aims <= 0 typically)
+
+		// ---------------- boundary ----------------
 		for (int k = 0; k < bdryCount; k++) {
 			int w = bdryListClosed[k];
 			double targetArea = vAims[w] / 2.0;
 
-			var fl = tri.getFlower(w); // open
+			List<Integer> fl = tri.getFlower(w); // open flower
 			int m = fl.size();
-			double area = 0.0, angsum = 0.0;
+			if (m < 2) {
+				continue;
+			}
+
+			double area = 0.0;
+			double angsum = 0.0;
 			double zx = localCentersX[w], zy = localCentersY[w];
 
 			for (int j = 0; j < m - 1; j++) {
-				int jr = fl.get(j), jl = fl.get(j + 1);
+				int jr = fl.get(j);
+				int jl = fl.get(j + 1);
+
 				double ang = MathUtil.angleAtCorner(zx, zy, localCentersX[jr], localCentersY[jr], localCentersX[jl], localCentersY[jl]);
+
 				double r = 0.5 * (hyp(jr, w) + hyp(jl, w) - hyp(jr, jl));
-				if (r > 0 && ang > 0) {
+				if (r > 0.0 && ang > 0.0 && Double.isFinite(r) && Double.isFinite(ang)) {
 					area += 0.5 * r * r * ang;
 					angsum += ang;
 				}
 			}
 
+			if (!(area > 0.0) || !(angsum > 0.0) || !Double.isFinite(area) || !Double.isFinite(angsum)) {
+				continue;
+			}
+
+			// Positive aim (polygonal mode): match sector area to the target.
+			// Negative aim (max packing): GO-style update, averaged to moderate.
+			double newr;
 			if (targetArea > 1e-3) {
-				localRadii[w] = Math.sqrt(Math.max(0.0, area / targetArea));
+				newr = Math.sqrt(area / targetArea);
+				if (newr > 0.0 && Double.isFinite(newr)) {
+					localRadii[w] = newr;
+				}
 			} else if (targetArea < -1e-3) {
-				double newr = Math.sqrt(Math.max(0.0, 2.0 * area / Math.max(1e-16, angsum)));
-				localRadii[w] = 0.5 * (newr + localRadii[w]);
+				newr = Math.sqrt(2.0 * area / Math.max(1e-16, angsum));
+				if (newr > 0.0 && Double.isFinite(newr)) {
+					localRadii[w] = 0.5 * (newr + localRadii[w]);
+				}
 			}
 		}
 	}
@@ -1685,5 +1590,64 @@ public class CircuPacker {
 		}
 		visErrMonitor.add(max);
 		return max;
+	}
+
+	private static final class OrderedCorners {
+		final int[] corners;
+		final double[] angles;
+
+		OrderedCorners(int[] corners, double[] angles) {
+			this.corners = corners;
+			this.angles = angles;
+		}
+	}
+
+	private OrderedCorners orderCornersCCW(int[] rawCorners, double[] rawAngles) {
+		final int m = rawCorners.length;
+
+		int[] pos = new int[m];
+		for (int i = 0; i < m; i++) {
+			pos[i] = boundaryPosition(rawCorners[i]);
+			if (pos[i] < 0) {
+				throw new IllegalArgumentException("Corner " + rawCorners[i] + " is not on the boundary loop");
+			}
+		}
+
+		Integer[] ord = new Integer[m];
+		for (int i = 0; i < m; i++) {
+			ord[i] = i;
+		}
+		Arrays.sort(ord, Comparator.comparingInt(i -> pos[i]));
+
+		// Rotate so the first user-supplied corner remains first
+		int anchor = 0;
+		for (int k = 0; k < m; k++) {
+			if (rawCorners[ord[k]] == rawCorners[0]) {
+				anchor = k;
+				break;
+			}
+		}
+
+		int[] outCorners = new int[m];
+		double[] outAngles = (rawAngles == null) ? null : new double[m];
+
+		for (int t = 0; t < m; t++) {
+			int src = ord[(anchor + t) % m];
+			outCorners[t] = rawCorners[src];
+			if (outAngles != null) {
+				outAngles[t] = rawAngles[src];
+			}
+		}
+
+		return new OrderedCorners(outCorners, outAngles);
+	}
+
+	private int boundaryPosition(int v) {
+		for (int i = 0; i < bdryCount; i++) {
+			if (bdryListClosed[i] == v) {
+				return i;
+			}
+		}
+		return -1;
 	}
 }

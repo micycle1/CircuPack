@@ -47,9 +47,9 @@ public final class BiCGStabSolver {
 	}
 
 	public static final class Result {
-		boolean converged;
-		int iters;
-		double relResidual;
+		public boolean converged;
+		public int iters;
+		public double relResidual;
 		String breakdown; // null if OK
 	}
 

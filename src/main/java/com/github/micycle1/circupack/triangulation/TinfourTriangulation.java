@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.tinfour.common.IConstraint;
 import org.tinfour.common.IIncrementalTin;
 import org.tinfour.common.IQuadEdge;
 import org.tinfour.common.Vertex;
@@ -24,8 +25,11 @@ public class TinfourTriangulation implements Triangulation {
 	protected final HashMap<Vertex, Integer> indexOf;
 	protected final List<List<Integer>> flowers;
 
+	final IConstraint constraint;
+
 	public TinfourTriangulation(IIncrementalTin tin) {
 		this.tin = tin;
+		constraint = tin.getConstraints().stream().filter(c -> c.isPolygon()).findFirst().orElse(null);
 
 		indexOf = new HashMap<>();
 		vertices = new ArrayList<>();
@@ -77,7 +81,9 @@ public class TinfourTriangulation implements Triangulation {
 
 	/*
 	 * In other words, don’t hardcode “CCW from prev to next.” Instead, “from prev
-	 * to next, choose the arc that runs through interior neighbors.”
+	 * to next, choose the arc that runs through interior neighbors.” <p> boundary
+	 * loop is CCW; “prev” is the CCW predecessor on the loop, “next” is the CCW
+	 * successor. The interior wedge is CCW from prev to next.
 	 */
 	private void postprocessBoundaryFlowersToInteriorOpen() {
 		int m = boundary.size();
@@ -127,22 +133,25 @@ public class TinfourTriangulation implements Triangulation {
 	private List<Integer> collectArc(List<Integer> nbrs, int from, int to, int stepSign) {
 		int n = nbrs.size();
 		int step = (stepSign >= 0) ? 1 : -1;
-		List<Integer> arc = new ArrayList<>();
+		List<Integer> arc = new ArrayList<>(n + 1);
 		int k = from;
-		arc.add(nbrs.get(k));
-		while (k != to) {
+		arc.add(nbrs.get(k)); // include 'from'
+		int guard = 0;
+		while (k != to && guard <= n + 2) {
 			k = (k + step + n) % n;
 			arc.add(nbrs.get(k));
-			if (arc.size() > n + 2) {
-				break; // safety
-			}
+			guard++;
+		}
+		if (guard > n + 2) {
+			throw new IllegalStateException("Arc collection overflow");
 		}
 		return arc;
 	}
 
 	private int countInterior(List<Integer> arc) {
 		int c = 0;
-		for (int u : arc) {
+		for (int t = 1; t < arc.size() - 1; t++) {
+			int u = arc.get(t);
 			if (!isBoundary.get(u)) {
 				c++;
 			}
@@ -150,18 +159,17 @@ public class TinfourTriangulation implements Triangulation {
 		return c;
 	}
 
-//	@Override
-//	public double[] getRadii() {
-//		double[] radii = new double[getVertexCount()];
-//		for (int i = 0; i < radii.length; i++) {
-//			radii[i] = i;
-//		}
-//
-//		for (int i = 0; i < getVertexCount(); i++) {
-//			radii[i] = isBoundary.get(i) ? Math.random():1;
-//		}
-//		return radii;
-//	}
+	/**
+	 * The packer index of a Tinfour vertex, e.g. for specifying polygon corner
+	 * vertices.
+	 */
+	public int indexOf(Vertex v) {
+		Integer i = indexOf.get(v);
+		if (i == null) {
+			throw new IllegalArgumentException("Vertex not found in triangulation: " + v);
+		}
+		return i;
+	}
 
 	@Override
 	public int getVertexCount() {
@@ -195,6 +203,27 @@ public class TinfourTriangulation implements Triangulation {
 	}
 
 	private List<Integer> buildBoundary() {
+		List<Vertex> boundary;
+		if (constraint == null) {
+			// unconstrained
+			boundary = boundaryFromPerimeter();
+		} else {
+			boundary = constraint.getVertices();
+		}
+
+		// drop the last if it closes the loop (shouldn't)
+		if (boundary.size() > 1 && boundary.get(0).equals(boundary.get(boundary.size() - 1))) {
+			boundary.remove(boundary.size() - 1);
+		}
+
+		if (!isCCW(boundary)) {
+			Collections.reverse(boundary);
+		}
+
+		return boundary.stream().map(v -> indexOf.get(v)).toList();
+	}
+
+	private List<Vertex> boundaryFromPerimeter() {
 		List<IQuadEdge> perimeter = new ArrayList<>();
 		tin.getPerimeter().forEach(perimeter::add);
 
@@ -210,16 +239,8 @@ public class TinfourTriangulation implements Triangulation {
 				throw new IllegalStateException("Perimeter edges are not contiguous");
 			}
 		}
-		// drop the last if it closes the loop (shouldn't)
-		if (boundary.size() > 1 && boundary.get(0).equals(boundary.get(boundary.size() - 1))) {
-			boundary.remove(boundary.size() - 1);
-		}
 
-		if (!isCCW(boundary)) {
-			Collections.reverse(boundary);
-		}
-
-		return boundary.stream().map(v -> indexOf.get(v)).toList();
+		return boundary;
 	}
 
 	private List<Integer> buildFlower(IQuadEdge e) {

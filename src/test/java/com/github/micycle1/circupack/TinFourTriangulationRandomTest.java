@@ -15,7 +15,6 @@ import org.tinfour.common.IIncrementalTin;
 import org.tinfour.common.Vertex;
 import org.tinfour.standard.IncrementalTin;
 
-import com.github.micycle1.circupack.CircuPacker;
 import com.github.micycle1.circupack.triangulation.TinfourTriangulation;
 
 public class TinFourTriangulationRandomTest {
@@ -42,9 +41,16 @@ public class TinFourTriangulationRandomTest {
 	void pack() {
 		var t = buildRandomTIN(15, 15, 1337, 0.25);
 		CircuPacker e = new CircuPacker(t);
-		e.initialize();
-		e.riffle(20);
-		e.writeBackToTriangulation();
+		e.riffle(0.01);
+
+		// max packing: boundary circles internally tangent to the unit circle
+		double[] r = e.getRadii();
+		double[] cx = e.getCentersX();
+		double[] cy = e.getCentersY();
+		for (int v : t.getBoundaryLoop()) {
+			double d = Math.hypot(cx[v], cy[v]) + r[v];
+			assertEquals(1.0, d, 0.05, "boundary circle " + v + " not on unit circle");
+		}
 	}
 
 	@ParameterizedTest

@@ -139,25 +139,30 @@ public class TinfourTest {
 
 	// a,b,c appear in this circular order in a list of length n?
 	private static boolean isCircularOrder(int n, int a, int b, int c) {
-		if (a < 0 || b < 0 || c < 0)
+		if (a < 0 || b < 0 || c < 0) {
 			return false;
+		}
 		return (Math.floorMod(b - a, n) > 0) && (Math.floorMod(c - b, n) > 0) && (Math.floorMod(a - c, n) > 0);
 	}
 
 	// Helper: Compare lists representing circular sequences up to rotation (same
 	// orientation).
 	private static boolean circularlyEqual(List<Integer> a, List<Integer> b) {
-		if (a.size() != b.size())
+		if (a.size() != b.size()) {
 			return false;
+		}
 		int n = a.size();
-		if (n == 0)
+		if (n == 0) {
 			return true;
+		}
 		int start = b.indexOf(a.get(0));
-		if (start < 0)
+		if (start < 0) {
 			return false;
+		}
 		for (int i = 0; i < n; i++) {
-			if (!a.get(i).equals(b.get((start + i) % n)))
+			if (!a.get(i).equals(b.get((start + i) % n))) {
 				return false;
+			}
 		}
 		return true;
 	}
