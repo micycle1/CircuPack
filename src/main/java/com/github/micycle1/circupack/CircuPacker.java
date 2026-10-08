@@ -171,6 +171,18 @@ public class CircuPacker {
 	// Anderson acceleration toggle (on by default); see riffle()
 	private boolean andersonAcceleration = true;
 
+	// Direct Newton solve of the angle-sum equations for polygonal packings (on
+	// by default); see riffle(). Its tolerances scale with the requested error:
+	// angle sums to within NEWTON_ANGLE_TOL_FACTOR * error radians, and the final
+	// center solve to NEWTON_LAYOUT_TOL_FACTOR * error relative residual (the
+	// center solve is what limits the returned visual error; this leaves roughly
+	// a 10x margin).
+	private boolean newtonSolver = true;
+	private static final double NEWTON_ANGLE_TOL_FACTOR = 1e-2;
+	private static final double NEWTON_LAYOUT_TOL_FACTOR = 1e-4;
+	private static final double NEWTON_MIN_ERROR = 1e-9;
+	private static final int NEWTON_MAX_ITER = 100;
+
 	/**
 	 * Builds the engine from the given triangulation: classifies
 	 * interior/boundary/orphan vertices, seeds working geometry, and defaults to
@@ -439,6 +451,24 @@ public class CircuPacker {
 	}
 
 	/**
+	 * Enables/disables the direct Newton solver for polygonal packings (on by
+	 * default). When enabled, {@link #riffle(double)} in {@link Mode#POLYGONAL}
+	 * solves the angle-sum equations for the radii directly (Newton in
+	 * log-radii) and lays out centers once at the end, instead of iterating
+	 * GOPack's layout/effective-radii fixed point. Besides converging in a
+	 * handful of iterations, this solves the stated problem exactly: corner
+	 * angles are as prescribed and side lengths are whatever the packing makes
+	 * them, whereas the fixed-point layout forces equal sides on odd polygons
+	 * and equal opposite sides on even ones. It also honours requested errors
+	 * below the fixed-point iteration's 1e-4 floor. Max packings, spheres and
+	 * triangulations with orphan vertices always use the fixed-point
+	 * iteration.
+	 */
+	public void setNewtonSolver(boolean enabled) {
+		this.newtonSolver = enabled;
+	}
+
+	/**
 	 * The CCW-ordered corner vertices in use for polygonal packing, or null in
 	 * MAX_PACK mode. Useful when corners were auto-chosen.
 	 */
@@ -466,10 +496,20 @@ public class CircuPacker {
 	 * Iterate boundary layout, interior embedding, and effective-radii updates
 	 * until the maximum relative visual error falls below the threshold (or an
 	 * iteration cap is hit). Returns the number of passes run.
+	 * <p>
+	 * Polygonal packings use the direct Newton solver instead (see
+	 * {@link #setNewtonSolver(boolean)}); the return value is then the number of
+	 * Newton iterations.
 	 *
 	 * @param maxRelativeError in practice a lot visually lower!
 	 */
 	public int riffle(double maxRelativeError) {
+		if (newtonSolver) {
+			int iters = newtonPack(maxRelativeError);
+			if (iters >= 0) {
+				return iters;
+			}
+		}
 		maxRelativeError = Math.max(1e-4, maxRelativeError);
 		int pass = 0;
 		double maxVis = Double.MAX_VALUE;
@@ -518,6 +558,143 @@ public class CircuPacker {
 		centersX = localCentersX.clone();
 		centersY = localCentersY.clone();
 		return pass;
+	}
+
+	/**
+	 * Newton path of {@link #riffle(double)} for polygonal packings: Euclidean
+	 * Newton over all radii (interior aims 2&pi;, side vertices &pi;, corners
+	 * their angles). The boundary is then laid out from the solved radii alone —
+	 * at a solution the sides close up by themselves — and interior centers come
+	 * from one GO center solve, which is exact for exact radii. Tolerances scale
+	 * with the requested error, and the returned geometry is checked against it
+	 * (tightening and re-solving if it falls short). Returns the Newton
+	 * iteration count, or -1 if this input is not handled (the caller then falls
+	 * back to the fixed-point iteration).
+	 */
+	private int newtonPack(double maxRelativeError) {
+		if (mode != Mode.POLYGONAL || hes != 0 || !hasBoundary || orphanCount > 0 || intCount == 0) {
+			return -1;
+		}
+		final double target = Math.max(NEWTON_MIN_ERROR, maxRelativeError);
+		boolean[] active = new boolean[n];
+		for (int v : intVerts) {
+			active[v] = true;
+		}
+		for (int i = 0; i < bdryCount; i++) {
+			active[bdryListClosed[i]] = true;
+		}
+		// every radius unknown; the solver handles the scale gauge
+		CurvatureNewton cn = new CurvatureNewton(flowers, isBoundary, active, active, vAims);
+		double[] r = new double[n];
+		for (int v = 0; v < n; v++) {
+			double rv = localRadii[v];
+			r[v] = (rv > 0.0 && Double.isFinite(rv)) ? rv : 1.0;
+		}
+
+		double angleTol = NEWTON_ANGLE_TOL_FACTOR * target;
+		double layoutTol = NEWTON_LAYOUT_TOL_FACTOR * target;
+		int iters = 0;
+		for (int attempt = 0; attempt < 3; attempt++) {
+			if (!cn.solve(r, Math.max(1e-12, angleTol), NEWTON_MAX_ITER) && !(cn.residual <= 1e-6)) {
+				return -1;
+			}
+			iters += cn.newtonIters;
+			System.arraycopy(r, 0, localRadii, 0, n);
+			if (isRightRectangle()) {
+				setRectCenters();
+			} else {
+				setPolygonCentersFromRadii();
+			}
+			double lt = Math.max(1e-13, layoutTol);
+			layoutCentersSolve(lt, lt);
+			lastMaxVisErr = updateVisErrorMonitor();
+			if (lastMaxVisErr <= target) {
+				break;
+			}
+			angleTol *= 1e-2;
+			layoutTol *= 1e-2;
+		}
+
+		radii = localRadii.clone();
+		centersX = localCentersX.clone();
+		centersY = localCentersY.clone();
+		return iters;
+	}
+
+	private boolean isRightRectangle() {
+		if (corners == null || corners.length != 4) {
+			return false;
+		}
+		double bendErr = 0.0;
+		for (int c : corners) {
+			bendErr += Math.abs(vAims[c] - Math.PI / 2.0);
+		}
+		return bendErr <= 1e-5;
+	}
+
+	/**
+	 * Polygon boundary layout from converged radii alone: walk the boundary with
+	 * edge lengths {@code r_i + r_j}, turning by {@code π − aim} at each corner.
+	 * At an exact solution the walk closes; the (roundoff-level) closure gap is
+	 * spread linearly by arc length, which keeps every side straight. Then
+	 * normalized like {@link #setPolygonCenters()}: corner centroid at the origin,
+	 * first corner at x = 1 (even n) or y = 1 (odd n).
+	 */
+	private void setPolygonCentersFromRadii() {
+		int numSides = corners.length;
+		boolean even = numSides % 2 == 0;
+		double edgeArg = even ? Math.PI : Math.PI + (Math.PI - vAims[corners[0]]) / 2.0;
+
+		double[] arc = new double[n];
+		double x = 0.0, y = 0.0, len = 0.0;
+		localCentersX[corners[0]] = 0.0;
+		localCentersY[corners[0]] = 0.0;
+		for (int k = 0; k < numSides; k++) {
+			if (k > 0) {
+				edgeArg += Math.PI - vAims[corners[k]];
+			}
+			double dx = Math.cos(edgeArg), dy = Math.sin(edgeArg);
+			int[] side = sides.get(k);
+			for (int i = 0; i < side.length - 1; i++) {
+				double step = localRadii[side[i]] + localRadii[side[i + 1]];
+				x += step * dx;
+				y += step * dy;
+				len += step;
+				if (k < numSides - 1 || i < side.length - 2) { // last step returns to corner 0
+					localCentersX[side[i + 1]] = x;
+					localCentersY[side[i + 1]] = y;
+					arc[side[i + 1]] = len;
+				}
+			}
+		}
+		double gapX = x - localCentersX[corners[0]], gapY = y - localCentersY[corners[0]];
+		for (int i = 0; i < bdryCount; i++) {
+			int b = bdryListClosed[i];
+			double f = arc[b] / len;
+			localCentersX[b] -= f * gapX;
+			localCentersY[b] -= f * gapY;
+		}
+
+		double avgx = 0, avgy = 0;
+		for (int c : corners) {
+			avgx += localCentersX[c];
+			avgy += localCentersY[c];
+		}
+		avgx /= numSides;
+		avgy /= numSides;
+		double scal = even ? localCentersX[corners[0]] - avgx : localCentersY[corners[0]] - avgy;
+		if (!(Math.abs(scal) > 1e-12)) {
+			scal = 1.0;
+		}
+		scal = Math.abs(scal);
+		for (int i = 0; i < bdryCount; i++) {
+			int b = bdryListClosed[i];
+			localCentersX[b] = (localCentersX[b] - avgx) / scal;
+			localCentersY[b] = (localCentersY[b] - avgy) / scal;
+		}
+		for (int v = 0; v < n; v++) {
+			localRadii[v] /= scal;
+		}
 	}
 
 	/****
@@ -1463,6 +1640,10 @@ public class CircuPacker {
 	}
 
 	private void layoutCentersSolve(double tol) {
+		layoutCentersSolve(tol, TOL_FLOOR);
+	}
+
+	private void layoutCentersSolve(double tol, double tolFloor) {
 		assembleSystem();
 
 		SparseCSR A = new SparseCSR(layCount, csrRowPtr[layCount], csrRowPtr, csrColIdx, csrVal, csrDiagInv);
@@ -1478,7 +1659,7 @@ public class CircuPacker {
 		seedWarmStart(solX, solY);
 
 		// writes to solX+solY
-		var r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, TOL_FLOOR, maxIters, cachedAMG);
+		var r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, tolFloor, maxIters, cachedAMG);
 
 		if (!r.converged()) {
 			// A stale preconditioner may be at fault (or a breakdown polluted the
@@ -1486,7 +1667,7 @@ public class CircuPacker {
 			// warm start.
 			rebuildAMG(A);
 			seedWarmStart(solX, solY);
-			r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, TOL_FLOOR, maxIters, cachedAMG);
+			r = CGSolver.solve2(A, rhsX, rhsY, solX, solY, tol, tolFloor, maxIters, cachedAMG);
 		}
 		if (!r.converged()) {
 			// last resort: BiCGStab tolerates numerical loss of definiteness

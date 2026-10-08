@@ -159,6 +159,82 @@ public class PolygonPackTest {
 		assertBoundaryAngleSums(tri, packer, ccwAims);
 	}
 
+	@Test
+	void newtonSolvesEquiangularPentagonExactly() {
+		// the equiangular pentagon with free side lengths is the documented
+		// problem; the fixed-point layout instead forces equal sides (and does not
+		// converge on this mesh), the Newton solver satisfies every angle sum
+		TinfourTriangulation tri = buildDiscTIN(60, 42);
+		CircuPacker packer = new CircuPacker(tri);
+		packer.setPolygonPack(5);
+		packer.riffle(1e-6);
+
+		assertMaxVisualError(tri, packer, 1e-6);
+		assertBoundaryOnSides(tri, packer);
+		assertRadiusAngleSums(tri, packer, Math.PI * (1.0 - 2.0 / 5.0), 1e-7);
+	}
+
+	@Test
+	void newtonHonoursTightTolerance() {
+		TinfourTriangulation tri = buildDiscTIN(60, 1337);
+		CircuPacker packer = new CircuPacker(tri);
+		packer.setRectanglePack();
+		packer.riffle(1e-9);
+		assertMaxVisualError(tri, packer, 1e-9);
+		assertRadiusAngleSums(tri, packer, Math.PI / 2.0, 1e-9);
+	}
+
+	@Test
+	void newtonMatchesFixedPointOnRectangle() {
+		// a rectangle packing is unique up to similarity and both solvers
+		// normalize it the same way, so their radii must agree to within the
+		// fixed-point iteration's accuracy
+		TinfourTriangulation tri = buildDiscTIN(60, 1337);
+		CircuPacker newton = new CircuPacker(tri);
+		newton.setRectanglePack();
+		newton.riffle(1e-8);
+		CircuPacker legacy = new CircuPacker(tri);
+		legacy.setNewtonSolver(false);
+		legacy.setRectanglePack();
+		legacy.riffle(1e-4);
+
+		double[] a = newton.getRadii(), b = legacy.getRadii();
+		for (int v = 0; v < a.length; v++) {
+			assertEquals(a[v], b[v], 1e-3 * a[v], "radius " + v);
+		}
+		assertEquals(newton.getAspect(), legacy.getAspect(), 1e-4);
+	}
+
+	// tangency error over EVERY edge (incl. boundary-boundary), relative to the
+	// smaller radius
+	private void assertMaxVisualError(Triangulation tri, CircuPacker packer, double tol) {
+		double[] r = packer.getRadii(), x = packer.getCentersX(), y = packer.getCentersY();
+		for (int v = 0; v < tri.getVertexCount(); v++) {
+			for (int w : tri.getFlower(v)) {
+				double e = Math.abs(Math.hypot(x[v] - x[w], y[v] - y[w]) - r[v] - r[w]) / Math.min(r[v], r[w]);
+				assertTrue(e <= tol, "edge " + v + "-" + w + " error " + e);
+			}
+		}
+	}
+
+	// angle sums computed from the radii (the curvature condition itself): 2pi
+	// inside, pi on sides, cornerAim at corners
+	private void assertRadiusAngleSums(Triangulation tri, CircuPacker packer, double cornerAim, double tol) {
+		double[] r = packer.getRadii();
+		List<Integer> corners = java.util.Arrays.stream(packer.getCorners()).boxed().toList();
+		for (int v = 0; v < tri.getVertexCount(); v++) {
+			List<Integer> fl = tri.getFlower(v);
+			boolean bd = tri.isBoundaryVertex(v);
+			int k = fl.size();
+			double sum = 0.0;
+			for (int j = 0; j < (bd ? k - 1 : k); j++) {
+				sum += Math.acos(MathUtil.cosAngle(r[v], r[fl.get(j)], r[fl.get((j + 1) % k)]));
+			}
+			double aim = !bd ? 2 * Math.PI : corners.contains(v) ? cornerAim : Math.PI;
+			assertEquals(aim, sum, tol, "angle sum at " + v);
+		}
+	}
+
 	// max relative visual error of the final packing must be small
 	private void assertConverged(CircuPacker packer) {
 		double max = 0.0;

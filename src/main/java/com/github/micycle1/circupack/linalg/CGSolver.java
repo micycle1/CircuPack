@@ -182,6 +182,95 @@ public final class CGSolver {
 		return res;
 	}
 
+	/**
+	 * Single right-hand-side flexible PCG for SPD {@code A}: solves
+	 * {@code A x = b} from the warm start in {@code x}, stopping at
+	 * {@code ‖r‖ ≤ tol·‖b‖}. Same flexible beta as {@link #solve2}.
+	 */
+	public static Result solve(SparseCSR A, double[] b, double[] x, double tol, int maxIters, Preconditioner precond) {
+		final int n = A.n;
+		Result res = new Result();
+		res.convergedY = true; // single system: Y unused
+		if (n == 0) {
+			res.convergedX = true;
+			return res;
+		}
+
+		double[] r = new double[n], z = new double[n], p = new double[n], q = new double[n], rOld = new double[n];
+		matVec(A, x, q);
+		for (int i = 0; i < n; i++) {
+			r[i] = b[i] - q[i];
+		}
+		double bn = norm2(b);
+		if (bn == 0.0) {
+			Arrays.fill(x, 0.0);
+			res.convergedX = true;
+			return res;
+		}
+		final double tolAbs = tol * bn;
+		double rn = norm2(r);
+		boolean conv = rn <= tolAbs;
+		if (!conv) {
+			applyPrecond(precond, r, z, n);
+			System.arraycopy(z, 0, p, 0, n);
+			double rho = dot(r, z);
+			for (int k = 1; k <= maxIters; k++) {
+				res.iters = k;
+				matVec(A, p, q);
+				double pq = dot(p, q);
+				if (!finite(pq) || pq <= 0.0 || !finite(rho) || Math.abs(rho) < 1e-300) {
+					res.breakdown = "loss of positive-definiteness (p·Ap=" + pq + ")";
+					break;
+				}
+				double alpha = rho / pq;
+				System.arraycopy(r, 0, rOld, 0, n);
+				for (int i = 0; i < n; i++) {
+					x[i] += alpha * p[i];
+					r[i] -= alpha * q[i];
+				}
+				rn = norm2(r);
+				if (rn <= tolAbs) {
+					conv = true;
+					break;
+				}
+				applyPrecond(precond, r, z, n);
+				double rhoNew = dot(r, z);
+				double beta = (rhoNew - dot(rOld, z)) / rho;
+				if (!finite(beta) || beta < 0.0) {
+					beta = 0.0;
+				}
+				for (int i = 0; i < n; i++) {
+					p[i] = z[i] + beta * p[i];
+				}
+				rho = rhoNew;
+			}
+		}
+		res.convergedX = conv;
+		res.relResX = rn / bn;
+		return res;
+	}
+
+	private static void applyPrecond(Preconditioner precond, double[] r, double[] z, int n) {
+		if (precond != null) {
+			precond.apply(r, z);
+		} else {
+			System.arraycopy(r, 0, z, 0, n);
+		}
+	}
+
+	static void matVec(SparseCSR A, double[] x, double[] y) {
+		final int[] rp = A.rowPtr;
+		final int[] ci = A.colIdx;
+		final double[] a = A.val;
+		for (int i = 0, n = A.n; i < n; i++) {
+			double s = 0.0;
+			for (int p = rp[i], pe = rp[i + 1]; p < pe; p++) {
+				s += a[p] * x[ci[p]];
+			}
+			y[i] = s;
+		}
+	}
+
 	private static void applyPrecond(Preconditioner precond, double[] rx, double[] ry, double[] zx, double[] zy, int n) {
 		if (precond != null) {
 			precond.apply2(rx, ry, zx, zy);
