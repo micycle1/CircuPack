@@ -13,6 +13,13 @@ public final class AMG implements Preconditioner {
 	private final double omega; // Jacobi weight
 	private final double diagEps = 1e-14;
 
+	/** Largest coarsest level that still gets a dense LU. */
+	private static final int MAX_DENSE_COARSE = 512;
+	/** Coarsening stops once a level shrinks by less than this factor of the previous one. */
+	private static final double STALL_RATIO = 0.9;
+	/** Damped-Jacobi sweeps used as the coarse solve when the coarsest level is too large for dense LU. */
+	private static final int COARSE_SWEEPS = 8;
+
 	private final Level top;
 
 	public AMG(int n, int[] rowPtr, int[] colIdx, double[] val) {
@@ -116,10 +123,7 @@ public final class AMG implements Preconditioner {
 	// Top level: skip pre-smooth and residual SpMV
 	private void vcycleTop(Level L, double[] b, double[] x) {
 		if (L.coarse == null) {
-			// direct solve: x += A^{-1} b
-			System.arraycopy(b, 0, L.tmp, 0, L.n);
-			L.lu.solveInPlace(L.tmp);
-			axpyInPlace(x, L.tmp, 1.0);
+			coarseSolve(L, b, x);
 			return;
 		}
 
@@ -149,9 +153,7 @@ public final class AMG implements Preconditioner {
 		residual(L, b, x, L.res);
 
 		if (L.coarse == null) {
-			System.arraycopy(L.res, 0, L.tmp, 0, L.n);
-			L.lu.solveInPlace(L.tmp);
-			axpyInPlace(x, L.tmp, 1.0);
+			coarseSolve(L, L.res, x);
 		} else {
 			restrictSum(L, L.res, L.rc);
 			Arrays.fill(L.ec, 0.0);
@@ -205,14 +207,36 @@ public final class AMG implements Preconditioner {
 		}
 	}
 
-	// x += A^{-1} b for both vectors (coarsest level is tiny; no fusion needed)
+	// x += A^{-1} b. Dense LU when the coarsest level is small; otherwise a fixed
+	// number of damped-Jacobi sweeps from zero (a symmetric, positive operator, so
+	// still a valid CG preconditioner).
+	private void coarseSolve(Level L, double[] b, double[] x) {
+		if (L.lu != null) {
+			System.arraycopy(b, 0, L.tmp, 0, L.n);
+			L.lu.solveInPlace(L.tmp);
+		} else {
+			Arrays.fill(L.tmp, 0.0);
+			jacobiSmooth(L, b, L.tmp, COARSE_SWEEPS, omega);
+		}
+		axpyInPlace(x, L.tmp, 1.0);
+	}
+
+	// x += A^{-1} b for both vectors (no fusion needed on the direct path)
 	private void coarseSolve2(Level L, double[] b1, double[] b2, double[] x1, double[] x2) {
-		System.arraycopy(b1, 0, L.tmp, 0, L.n);
-		L.lu.solveInPlace(L.tmp);
-		axpyInPlace(x1, L.tmp, 1.0);
-		System.arraycopy(b2, 0, L.tmp, 0, L.n);
-		L.lu.solveInPlace(L.tmp);
-		axpyInPlace(x2, L.tmp, 1.0);
+		if (L.lu != null) {
+			System.arraycopy(b1, 0, L.tmp, 0, L.n);
+			L.lu.solveInPlace(L.tmp);
+			axpyInPlace(x1, L.tmp, 1.0);
+			System.arraycopy(b2, 0, L.tmp, 0, L.n);
+			L.lu.solveInPlace(L.tmp);
+			axpyInPlace(x2, L.tmp, 1.0);
+		} else {
+			Arrays.fill(L.tmp, 0.0);
+			Arrays.fill(L.tmp2, 0.0);
+			jacobiSmooth2(L, b1, b2, L.tmp, L.tmp2, COARSE_SWEEPS, omega);
+			axpyInPlace(x1, L.tmp, 1.0);
+			axpyInPlace(x2, L.tmp2, 1.0);
+		}
 	}
 
 	private void jacobiSmooth2(Level L, double[] b1, double[] b2, double[] x1, double[] x2, int steps, double w) {
@@ -346,8 +370,8 @@ public final class AMG implements Preconditioner {
 
 		while (built < maxLevels && cur.n > minCoarseSize) {
 			Agg agg = pairwiseAggregate(cur.n, cur.rowPtr, cur.colIdx, cur.val);
-			if (agg.nc >= cur.n) {
-				break;
+			if (agg.nc >= cur.n * STALL_RATIO) {
+				break; // coarsening has stalled; more levels would not pay for themselves
 			}
 
 			// children lists for fast restrict/prolong
@@ -382,7 +406,9 @@ public final class AMG implements Preconditioner {
 			built++;
 		}
 
-		cur.lu = DenseLU.fromCSR(cur.n, cur.rowPtr, cur.colIdx, cur.val, diagEps);
+		if (cur.n <= MAX_DENSE_COARSE) {
+			cur.lu = DenseLU.fromCSR(cur.n, cur.rowPtr, cur.colIdx, cur.val, diagEps);
+		} // else: coarse solve falls back to Jacobi sweeps (dense LU is O(n^3) to build, O(n^2) per apply)
 		return head;
 	}
 
@@ -411,6 +437,7 @@ public final class AMG implements Preconditioner {
 		L.res = new double[n];
 		L.res2 = new double[n];
 		L.tmp = new double[n];
+		L.tmp2 = new double[n];
 		return L;
 	}
 
@@ -419,7 +446,7 @@ public final class AMG implements Preconditioner {
 		int[] rowPtr, colIdx;
 		double[] val;
 		double[] Dinv;
-		double[] res, tmp;
+		double[] res, tmp, tmp2;
 		double[] res2; // second-vector workspace for apply2
 
 		// aggregation
